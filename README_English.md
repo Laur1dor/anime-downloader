@@ -79,3 +79,18 @@ and 1,494,494,732-byte parts; Telegram accepted both. The beginning and end
 of the original and each part decoded with audio. A separate check submitted
 the 1.6 GB part through the shared read-only local path without a large Bot API `/tmp` copy.
 Source and network availability can change after this test.
+
+## Optional parser repairs
+
+The separate `maintenance/` controller can propose a small repair after repeated
+parser failures. A new regression test must fail before the patch and pass after
+it; the existing suite, isolated candidate suite and CI must pass. Candidate tests
+have no network, production credentials or writable production mounts. Automatic
+changes are restricted to specific parser/player files, with three attempts per
+24 hours and one per incident group/source version. Waiting does not call the provider.
+
+Releases drain current jobs and check the new process. Failed activation restores
+the previous image and source; an independent watchdog handles coordinator death.
+A single polling process has a short restart gap. The mechanism is opt-in and does
+not promise to repair every error. Configure the generator, credentials, paths and
+watchdog separately; operational dependencies are in `requirements-ops.txt`.

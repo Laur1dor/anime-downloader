@@ -14,6 +14,7 @@ from animedl.handlers import admin, common, flow, search
 from animedl.handlers.access import AccessMiddleware
 from animedl.logging_setup import setup_logging
 from animedl.observability import AuditMiddleware, AuditStore
+from animedl.runtime_health import RuntimeHealth
 from animedl.telegram_client import build_bot
 
 log = logging.getLogger("animedl")
@@ -73,6 +74,11 @@ async def main() -> None:
     dp["catalog"] = catalog
     dp["audit"] = audit
 
+    health = RuntimeHealth(cfg.cache_db_path.parent)
+    dp.startup.register(health.start)
+    dp.message.outer_middleware(health)
+    dp.callback_query.outer_middleware(health)
+
     # Outer middleware also sees access-denied and unmatched actions.
     dp.message.outer_middleware(AuditMiddleware())
     dp.callback_query.outer_middleware(AuditMiddleware())
@@ -91,6 +97,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        await health.close()
         if audit:
             await audit.close()
         cache.close()

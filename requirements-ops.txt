@@ -1,0 +1,2 @@
+-r requirements.txt
+paramiko>=3.5,<5
