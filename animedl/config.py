@@ -42,6 +42,7 @@ class Config:
 
     retry_cache_bytes: int = 4 * 1024 ** 3
     retry_cache_hours: int = 24
+    tg_local_file_root: Path | None = None
     audit_database_url: str = field(default="", repr=False)
     audit_retention_days: int = 30
     audit_max_events: int = 50000
@@ -102,6 +103,7 @@ def load_config() -> Config:
         library_dir=(_path("LIBRARY_DIR", "") if _get("LIBRARY_DIR") else None),
         retry_cache_bytes=max(0, _get_int("RETRY_CACHE_MB", 4096)) * 1024 ** 2,
         retry_cache_hours=max(1, _get_int("RETRY_CACHE_HOURS", 24)),
+        tg_local_file_root=(_path("TELEGRAM_LOCAL_FILE_ROOT", "") if _get("TELEGRAM_LOCAL_FILE_ROOT") else None),
         audit_database_url=_get("AUDIT_DATABASE_URL"),
         audit_retention_days=max(1, _get_int("AUDIT_RETENTION_DAYS", 30)),
         audit_max_events=max(100, _get_int("AUDIT_MAX_EVENTS", 50000)),

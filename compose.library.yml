@@ -5,6 +5,8 @@ services:
     environment:
       LIBRARY_DIR: /app/library
       MEDIA_ROOT: ${MEDIA_ROOT:-}
+      TELEGRAM_API_LOCAL_MODE: "1"
+      TELEGRAM_LOCAL_FILE_ROOT: /app/media/.animedl-work
     volumes:
       - type: bind
         source: ${LIBRARY_HOST_DIR:?set LIBRARY_HOST_DIR to an existing mounted media folder}
@@ -14,5 +16,16 @@ services:
       - type: bind
         source: ${MEDIA_HOST_ROOT:-${LIBRARY_HOST_DIR}}
         target: /app/media
+        bind:
+          create_host_path: false
+
+  telegram-bot-api:
+    environment:
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - type: bind
+        source: ${MEDIA_HOST_ROOT:-${LIBRARY_HOST_DIR}}/.animedl-work
+        target: /app/media/.animedl-work
+        read_only: true
         bind:
           create_host_path: false

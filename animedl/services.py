@@ -182,10 +182,11 @@ async def process_episode(
 ) -> EpisodeResult:
     audit_started = time.monotonic()
     audit_job = uuid.uuid4().hex
+    actual_quality = quality
     def audit_result(result):
         emit("episode_finished", user_id, result.status, job_id=audit_job,
              title=title.title, site=title.site, episode=episode.number, season=episode.season,
-             voice=voice, provider=provider, quality=quality, delivery=delivery,
+             voice=voice, provider=provider, quality=actual_quality, delivery=delivery,
              category=library_category or title.media_category, bytes=result.size_bytes,
              telegram=result.telegram, library=result.library, source_failed=result.source_failed,
              duration_ms=int((time.monotonic() - audit_started) * 1000))
@@ -258,6 +259,7 @@ async def process_episode(
             cached_key = make_cache_hash(title.site, cache_identity, episode.number, voice, cached_provider, quality)
             cached = cache.get(cached_key, expected_quality=quality)
             if cached:
+                provider = cached_provider
                 caption = html.escape(f"{title.title} — {tag.lower()} • {voice} • {cached_provider} • {quality}p")
                 break
     if cached:
@@ -318,6 +320,7 @@ async def process_episode(
                                 else:
                                     variant = _pick_variant(variants, quality)
                                 provider = button.provider
+                                actual_quality = variant.quality
                                 caption = video_caption(variant.quality)
                                 key = make_cache_hash(title.site, cache_identity, episode.number, voice, provider, variant.quality)
                                 if wants_tg and res.telegram == "skipped":
@@ -466,7 +469,11 @@ async def process_episode(
                     suffix = f" • часть {i}/{len(parts)}" if len(parts) > 1 else ""
                     await on_status(f"{tag}: отправка в Telegram{suffix}…")
                     upload = asyncio.create_task(send_video_file(bot, chat_id, part.path,
-                        width=part.width, height=part.height, duration=part.duration, caption=caption + suffix))
+                        width=part.width, height=part.height, duration=part.duration, caption=caption + suffix,
+                        local_file_root=(getattr(cfg, "tg_local_file_root", None)
+                            if user_id is not None and user_id == cfg.admin_id
+                            and getattr(cfg, "tg_api_base_url", "")
+                            and getattr(cfg, "tg_api_local_mode", False) else None)))
                     try:
                         while not upload.done():
                             if cancel_check and cancel_check():

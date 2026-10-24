@@ -21,9 +21,12 @@ Bot API has no host port published. The optional restart feature mounts Docker s
 Mount storage on the host first. Set `LIBRARY_HOST_DIR=/srv/media/Anime`, `MEDIA_HOST_ROOT=/srv/media`, `MEDIA_ROOT=/app/media`, and your actual `JELLYFIN_URL` and API key in `.env`. Jellyfin needs read access, the bot needs write access to the same files.
 
 ```bash
+mkdir -p /srv/media/.animedl-work
 docker compose -f compose.yml -f compose.library.yml config --quiet
 docker compose -f compose.yml -f compose.library.yml up -d --build
 ```
+
+Replace `/srv/media` with the actual `MEDIA_HOST_ROOT`, or `LIBRARY_HOST_DIR` if no media root is set. Create `.animedl-work` on the mounted storage first: Compose deliberately uses `create_host_path: false`. Check that Bot API can read the files. This override shares only that working subdirectory read-only with Bot API at the same path. Eligible owner files use local `file://` delivery, avoiding an extra HTTP spool copy on Bot API's system disk. Ordinary users still use normal file upload and never use the owner's NAS. Do not expand the mount to your entire storage. Without shared local paths, HTTP uploads to a local Bot API may need extra temporary disk space.
 
 Use TV libraries for Anime/Series and movie libraries for AnimeMovies/Movies; verify directory names in `animedl/models.py`. Only the owner can use the owner's storage. Telegram may receive several MP4 parts while the library retains the complete file.
 
@@ -47,7 +50,7 @@ Keep `.env`, keys, cookies and user databases private. Report errors with timest
 
 Owner-only `/stats` and `/errors` show the retained event history. Events include actions and download/delivery outcomes, sources, quality and sizes. Message contents, complete URLs, keys and exception text are excluded. User identifiers remain personal data: restrict database access and tell users about collection.
 
-The local SQLite journal defaults to 50,000 events and 30 days (`AUDIT_MAX_EVENTS`, `AUDIT_RETENTION_DAYS`). Statistics cover the retained window. Repeated identical error alerts go only to the owner, at most once per 30 minutes; `AUDIT_ALERTS=0` disables alerts.
+The local SQLite journal defaults to 50,000 events and 30 days (`AUDIT_MAX_EVENTS`, `AUDIT_RETENTION_DAYS`). Commands query PostgreSQL when available and explicitly show local fallback otherwise; statistics cover retained history, not the bot's entire lifetime. Repeated identical error alerts go only to the owner, at most once per 30 minutes; `AUDIT_ALERTS=0` disables alerts.
 
 For optional PostgreSQL, set a long random alphanumeric `AUDIT_POSTGRES_PASSWORD` in `.env`, then run:
 
@@ -55,7 +58,7 @@ For optional PostgreSQL, set a long random alphanumeric `AUDIT_POSTGRES_PASSWORD
 docker compose -f compose.yml -f compose.observability.yml up -d --build
 ```
 
-You may also include `-f compose.library.yml`. PostgreSQL 17 Alpine uses a separate volume and internal network without publishing a host port, so another host service on 5432 does not conflict. Local events replicate asynchronously with stable identifiers and retries. PostgreSQL retention is time-based, without the local row-count cap. Back it up separately. Alpine is an image variant, not a user-count limit; capacity depends on activity and resources. Error monitoring does not automatically change production code.
+You may also include `-f compose.library.yml`. PostgreSQL 17 Alpine uses a separate volume and internal network without publishing a host port, so another host service on 5432 does not conflict. Local events replicate asynchronously with stable identifiers and retries. PostgreSQL enforces age retention and `AUDIT_PG_MAX_EVENTS=100000`; cleanup runs once per minute, allowing brief bursts above the cap. Back it up separately. Alpine is an image variant, not a user-count limit; capacity depends on activity and resources. Error monitoring does not automatically change production code.
 
 ## Development and CI
 
@@ -69,3 +72,10 @@ docker build -t anime-downloader-check .
 ```
 
 GitHub Actions runs tests, including actual `ffmpeg`, and builds both images without secrets. It does not deploy to your server. Tests and samples do not replace a complete real-world upload of a file larger than 2 GB. See the Russian README for the troubleshooting table.
+
+A full test on 24 October 2026 used a real **3,110,757,150-byte** 1080p film,
+1920×1080 H.264/AAC, 1:44:53. Lossless splitting produced 1,615,322,096-byte
+and 1,494,494,732-byte parts; Telegram accepted both. The beginning and end
+of the original and each part decoded with audio. A separate check submitted
+the 1.6 GB part through the shared read-only local path without a large Bot API `/tmp` copy.
+Source and network availability can change after this test.

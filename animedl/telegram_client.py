@@ -43,7 +43,8 @@ async def _send_with_flood_retry(factory: Callable[[], Awaitable[Message]],
 def build_bot(cfg: Config) -> Bot:
     if cfg.tg_api_base_url:
         # Локальный Bot API сервер (localhost): DPI не мешает, стримим файлы до 2 ГБ.
-        api = TelegramAPIServer.from_base(cfg.tg_api_base_url.rstrip("/").removesuffix("/bot"))
+        api = TelegramAPIServer.from_base(cfg.tg_api_base_url.rstrip("/").removesuffix("/bot"),
+                                         is_local=cfg.tg_api_local_mode)
         session = AiohttpSession(api=api)
         log.info("Использую локальный Bot API сервер: %s", cfg.tg_api_base_url)
     else:
@@ -60,11 +61,25 @@ def build_bot(cfg: Config) -> Bot:
 async def send_video_file(
     bot: Bot, chat_id: int, path: Path, *,
     width: int, height: int, duration: int, caption: str = "",
+    local_file_root: Path | None = None,
 ) -> Message:
     """Отправить файл с диска, явно передав размеры (чтобы Telegram не искажал пропорции)."""
+    video = FSInputFile(path)
+    api = getattr(getattr(bot, "session", None), "api", None)
+    if local_file_root is not None and getattr(api, "is_local", False) is True:
+        try:
+            root = Path(local_file_root).resolve(strict=True)
+            resolved = Path(path).resolve(strict=True)
+            if root.is_dir() and resolved.is_file() and resolved.is_relative_to(root):
+                # The API container mounts this directory read-only at the same
+                # absolute path. Avoid a second multi-GB HTTP upload spool.
+                video = resolved.as_uri()
+        except (OSError, RuntimeError, ValueError):
+            # Other users and files outside the shared allowlist use HTTP upload.
+            pass
     return await _send_with_flood_retry(lambda: bot.send_video(
         chat_id=chat_id,
-        video=FSInputFile(path),
+        video=video,
         width=width or None,
         height=height or None,
         duration=duration or None,

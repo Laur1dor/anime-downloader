@@ -74,13 +74,18 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.cfg.media_root = self.root / 'media'
         self.cfg.media_root.mkdir()
         (self.cfg.media_root / '.animedl-library').touch()
+        self.cfg.tg_api_base_url = "http://telegram-bot-api:8081"
+        self.cfg.tg_api_local_mode = True
+        self.cfg.tg_local_file_root = self.cfg.media_root / '.animedl-work'
         await self.run_episode(user_id=2)
         self.assertFalse((self.cfg.media_root / '.animedl-work').exists())
+        self.assertIsNone(self.upload.call_args.kwargs['local_file_root'])
         await self.run_episode(user_id=1)
         workspace = self.cfg.media_root / '.animedl-work'
         self.assertTrue(workspace.is_dir())
         self.assertEqual(list(workspace.iterdir()), [])
         self.assertTrue(self.paths[-1].is_relative_to(workspace))
+        self.assertEqual(self.upload.call_args.kwargs['local_file_root'], workspace)
 
     async def test_external_metadata_failure_does_not_block_archive(self):
         self.kwargs['title'].mal_id = 60636

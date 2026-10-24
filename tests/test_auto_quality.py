@@ -169,6 +169,22 @@ class AutoProviderTests(unittest.IsolatedAsyncioTestCase):
             make_cache_hash('animego', '123', 1, 'V', 'Kodik', 720))
         self.assertEqual(self.cache.put.call_args.kwargs['quality'], 720)
 
+    async def test_audit_uses_actual_quality_after_manual_fallback(self):
+        with patch('animedl.services.emit') as events:
+            await self.run_episode(provider='Kodik')
+        finished = next(c for c in events.call_args_list if c.args[0] == 'episode_finished')
+        self.assertEqual((finished.kwargs['provider'], finished.kwargs['quality']), ('Kodik', 720))
+
+    async def test_cached_auto_delivery_records_actual_provider_without_source(self):
+        key = make_cache_hash('animego', '123', 1, 'V', 'Alloha', 1080)
+        self.cache.get.side_effect = lambda found, **kw: 'file' if found == key else None
+        with patch('animedl.services.emit') as events:
+            result = await self.run_episode()
+        self.assertEqual(result.telegram, 'cached')
+        self.parser.fetch_episode_players.assert_not_awaited()
+        finished = next(c for c in events.call_args_list if c.args[0] == 'episode_finished')
+        self.assertEqual(finished.kwargs['provider'], 'Alloha')
+
     async def test_each_episode_resolves_its_own_players(self):
         self.parser.fetch_episode_players.side_effect = [
             [PlayerButton('V', 'Aloha', 'one')], [PlayerButton('V', 'Kodik', 'two')]]
