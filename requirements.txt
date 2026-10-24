@@ -1,0 +1,9 @@
+aiogram>=3.4
+beautifulsoup4
+lxml
+httpx[socks]
+yt-dlp
+python-dotenv
+docker
+playwright>=1.55,<2
+asyncpg>=0.30,<1

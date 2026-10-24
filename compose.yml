@@ -1,0 +1,33 @@
+services:
+  bot:
+    build: .
+    container_name: anime-bot
+    env_file: .env
+    environment:
+      TELEGRAM_API_BASE_URL: http://telegram-bot-api:8081
+      CACHE_DB_PATH: /app/data/cache.sqlite3
+      TMP_DIR: /app/tmp
+      LOG_DIR: /app/data/logs
+      RATE_FILE: /app/data/bandwidth_mbit.txt
+      RELOAD_CONTAINERS: ${RELOAD_CONTAINERS:-anime-bot-api,anime-bot}
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on: [telegram-bot-api]
+    restart: unless-stopped
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.botapi
+    container_name: anime-bot-api
+    cap_add: [NET_ADMIN]
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
+      UPLOAD_RATE_MBIT: ${UPLOAD_RATE_MBIT:-0}
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+      - ./data:/ratedata:ro
+    restart: unless-stopped
+volumes:
+  bot-api-data:

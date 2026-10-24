@@ -1,0 +1,9 @@
+# telegram-bot-api + tc (шейпинг egress-загрузки в Telegram) поверх офиц. образа.
+FROM aiogram/telegram-bot-api:latest
+
+RUN apk add --no-cache iproute2
+
+COPY botapi-entrypoint.sh /shaped-entrypoint.sh
+RUN chmod +x /shaped-entrypoint.sh && sed -i 's/\r$//' /shaped-entrypoint.sh
+
+ENTRYPOINT ["/shaped-entrypoint.sh"]

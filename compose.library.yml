@@ -1,0 +1,18 @@
+# Optional owner-only media folder. Mount your NAS on the host first.
+# docker compose -f compose.yml -f compose.library.yml up -d
+services:
+  bot:
+    environment:
+      LIBRARY_DIR: /app/library
+      MEDIA_ROOT: ${MEDIA_ROOT:-}
+    volumes:
+      - type: bind
+        source: ${LIBRARY_HOST_DIR:?set LIBRARY_HOST_DIR to an existing mounted media folder}
+        target: /app/library
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MEDIA_HOST_ROOT:-${LIBRARY_HOST_DIR}}
+        target: /app/media
+        bind:
+          create_host_path: false

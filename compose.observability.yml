@@ -1,0 +1,36 @@
+# PostgreSQL доступен только внутри Docker; порт хоста не требуется.
+# docker compose -f compose.yml -f compose.observability.yml up -d --build
+services:
+  bot:
+    environment:
+      AUDIT_DATABASE_URL: postgresql://animedl:${AUDIT_POSTGRES_PASSWORD:?Set AUDIT_POSTGRES_PASSWORD in .env}@audit-db:5432/animedl
+    networks:
+      - default
+      - audit
+
+  audit-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: animedl
+      POSTGRES_USER: animedl
+      POSTGRES_PASSWORD: ${AUDIT_POSTGRES_PASSWORD:?Set AUDIT_POSTGRES_PASSWORD in .env}
+    volumes:
+      - audit-data:/var/lib/postgresql/data
+    networks:
+      - audit
+    shm_size: 64mb
+    mem_limit: 256m
+    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=20]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U animedl -d animedl']
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  audit:
+    internal: true
+
+volumes:
+  audit-data:
