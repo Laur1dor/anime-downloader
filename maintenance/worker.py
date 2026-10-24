@@ -147,7 +147,7 @@ asyncio.run(main())
         # Use a temporary trusted script; owner text is stdin, never shell code.
         with self.client.open_sftp() as s, s.open("/root/anime-repair/notify.py", "w") as f:
             f.write(code)
-        command = "docker cp /root/anime-repair/notify.py anime-bot:/tmp/repair-notify.py && docker exec -i anime-bot python /tmp/repair-notify.py"
+        command = "docker cp /root/anime-repair/notify.py anime-bot:/tmp/repair-notify.py && docker exec -i -e PYTHONPATH=/app anime-bot python /tmp/repair-notify.py"
         stdin, out, err = self.client.exec_command(command, timeout=20)
         stdin.write(text[:3000]); stdin.channel.shutdown_write()
         out.read()

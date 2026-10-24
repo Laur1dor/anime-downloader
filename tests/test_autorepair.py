@@ -192,6 +192,16 @@ class DrainTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_owner_notification_sets_package_path_for_temporary_script(self):
+        from unittest.mock import MagicMock
+        remote=worker.Remote.__new__(worker.Remote);remote.client=MagicMock()
+        incoming,outgoing,errors=MagicMock(),MagicMock(),MagicMock()
+        outgoing.channel.recv_exit_status.return_value=0
+        remote.client.exec_command.return_value=(incoming,outgoing,errors)
+        remote.notify('Status')
+        self.assertIn('-e PYTHONPATH=/app',remote.client.exec_command.call_args.args[0])
+        incoming.write.assert_called_once_with('Status')
+
     def test_provider_cannot_overwrite_existing_log_or_follow_link(self):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/'protected';path.write_text('keep')
