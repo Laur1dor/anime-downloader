@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from maintenance.policy import Ledger, eligible, validate
 from maintenance.policy import source_hash
 from maintenance import release
+from maintenance import worker
 from animedl.runtime_health import RuntimeHealth
 
 
@@ -143,6 +144,36 @@ class ReleaseTests(unittest.TestCase):
             replace.assert_not_called()
         self.assertFalse((self.root/'data/release.drain').exists())
 
+    def test_candidate_retention_deletes_only_old_owned_directory(self):
+        root = self.state/'candidates';root.mkdir()
+        for i in range(11):
+            p=root/f'{i:032x}';p.mkdir()
+            import os
+            os.utime(p,(100+i,100+i))
+        result=type('Result',(),{'stdout':'unused'})()
+        with patch.object(release,'image',return_value='current'),patch.object(release,'run',return_value=result):
+            release.prune_candidates()
+        self.assertFalse((root/('0'*32)).exists())
+        self.assertEqual(len(list(root.iterdir())),10)
+
+    def test_healthy_candidate_commits_source_after_observation(self):
+        request_id,source=self.candidate()
+        clock=[time.time()]
+        def advance(seconds):clock[0]+=seconds
+        result=type('Result',(),{'stdout':json.dumps([{'RestartCount':0,'State':{'Status':'running'}}])})()
+        with patch.object(release,'snapshot',return_value=source), \
+             patch.object(release,'image',return_value='old'), \
+             patch.object(release,'health',return_value={'active':0}), \
+             patch.object(release,'replace_image') as replace, \
+             patch.object(release,'run',return_value=result), \
+             patch.object(release.time,'time',side_effect=lambda:clock[0]), \
+             patch.object(release.time,'sleep',side_effect=advance):
+            self.assertEqual(release.activate(request_id,'b'*40)['status'],'committed')
+        replace.assert_called_once_with('candidate')
+        self.assertEqual((self.root/'parser.py').read_text(),'fixed')
+        self.assertEqual(release.journal()['status'],'committed')
+        self.assertFalse((self.root/'data/release.drain').exists())
+
 
 class DrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_drain_blocks_new_work_but_existing_handler_finishes(self):
@@ -158,3 +189,41 @@ class DrainTests(unittest.IsolatedAsyncioTestCase):
             guard.write()
             h = json.loads((Path(d) / 'runtime-health.json').read_text())
             self.assertTrue(h['draining']); self.assertTrue(h['ready'])
+
+
+class ProviderTests(unittest.TestCase):
+    def test_provider_cannot_overwrite_existing_log_or_follow_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'protected';path.write_text('keep')
+            with self.assertRaises(FileExistsError):worker.exclusive_write(path,'overwrite')
+            self.assertEqual(path.read_text(),'keep')
+    def test_generator_receives_no_inherited_project_secret_and_saves_usage(self):
+        with tempfile.TemporaryDirectory() as d:
+            destination = Path(d)/'request'
+            def provider(args, **kwargs):
+                self.assertNotIn('PROJECT_TEST_SECRET', kwargs['env'])
+                self.assertNotIn('PARENT_SESSION_ID', kwargs['env'])
+                self.assertEqual(kwargs['env']['HTTPS_PROXY'], 'socks5h://proxy.example.org:1080')
+                Path(args[2]).write_text(json.dumps(dict(summary='Insufficient evidence',files=[],test={'path':'','content':''})))
+                return type('Result', (), {'returncode':0,'stdout':json.dumps({'type':'turn.completed','usage':{'input_tokens':12,'output_tokens':3}}),'stderr':''})()
+            with patch.dict('os.environ', {'PROJECT_TEST_SECRET':'private-value','PARENT_SESSION_ID':'parent-session'}), \
+                 patch.object(worker.subprocess,'run',side_effect=provider):
+                result = worker.generate({'count':2},{'module':'clean'},['provider','{schema}','{answer}'],
+                                         destination,proxy='socks5h://proxy.example.org:1080')
+            self.assertEqual(result['files'],[])
+            self.assertEqual(json.loads((destination/'usage.json').read_text())['input_tokens'],12)
+
+    def test_dirty_checkout_stops_before_contacting_provider_or_server(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(worker,'PRIVATE',Path(d)), \
+             patch.object(worker,'git',return_value=' M edited.py'), patch.object(worker,'Remote') as remote:
+            self.assertEqual(worker.once({'public_root':d})['status'],'paused_dirty_checkout')
+            remote.assert_not_called()
+
+    def test_interrupted_attempt_pauses_instead_of_spending_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            ledger=Ledger(Path(d)/'ledger.sqlite3');ledger.claim('a'*16,'source');ledger.close()
+            with patch.object(worker,'PRIVATE',Path(d)),patch.object(worker,'git',return_value=''), \
+                 patch.object(worker,'Remote') as remote:
+                self.assertEqual(worker.once({'public_root':d})['status'],'paused_interrupted_attempt')
+                self.assertTrue((Path(d)/'reconcile.json').exists())
+                remote.assert_not_called()

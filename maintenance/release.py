@@ -49,8 +49,11 @@ def snapshot(root=ROOT):
 
 
 def atomic(path, value):
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    with temp.open('w',encoding='utf-8') as output:
+        json.dump(value,output,ensure_ascii=False)
+        output.flush()
+        os.fsync(output.fileno())
     temp.replace(path)
 
 
@@ -92,7 +95,28 @@ def sandbox(image_id, source, command, timeout=300):
         run(["docker", "rm", "-f", name], check=False, timeout=15)
 
 
+def prune_candidates():
+    import re
+    root = STATE / 'candidates'
+    if not root.exists():
+        return
+    tx = journal() or {}
+    protected = {image(), tx.get('previous')}
+    entries = sorted((p for p in root.iterdir() if re.fullmatch(r'[a-f0-9]{32}', p.name)
+                      and p.is_dir() and not p.is_symlink()), key=lambda p:p.stat().st_mtime, reverse=True)
+    for path in entries[10:]:
+        if path.name == tx.get('id') or path.resolve().parent != root.resolve():
+            continue
+        tag = 'anime-bot-repair:' + path.name
+        found = run(['docker','image','inspect',tag,'--format','{{.Id}}'], check=False, timeout=15)
+        if found.stdout.strip() in protected:
+            continue
+        run(['docker','image','rm',tag,'anime-bot-repair-base:'+path.name],check=False,timeout=30)
+        shutil.rmtree(path)
+
+
 def prepare(request):
+    prune_candidates()
     if shutil.disk_usage(ROOT).free < 512 * 1024 * 1024:
         raise ValueError("Insufficient free disk for isolated repair")
     original = snapshot()

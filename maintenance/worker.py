@@ -13,7 +13,6 @@ import tempfile
 import time
 
 from dotenv import dotenv_values
-import paramiko
 
 from maintenance.policy import Ledger, eligible, source_hash, validate
 
@@ -32,7 +31,16 @@ SCHEMA = {"type": "object", "additionalProperties": False,
                               "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}
 
 
-def generate(incident, files, command, destination, user=None):
+def exclusive_write(path, content):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,'O_NOFOLLOW',0), 0o600)
+    with os.fdopen(descriptor,'w',encoding='utf-8') as output:
+        output.write(content)
+
+
+def generate(incident, files, command, destination, user=None, proxy=None):
+    destination = destination.absolute()
+    if destination.resolve() != destination or any(p.is_symlink() for p in destination.parents):
+        raise ValueError('Linked provider directory')
     destination.mkdir(parents=True, exist_ok=False)
     if user:
         import pwd
@@ -61,24 +69,32 @@ def generate(incident, files, command, destination, user=None):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"):
         if key in os.environ:
             env[key] = os.environ[key]
+    if proxy:
+        env['HTTPS_PROXY'] = proxy
+        env['HTTP_PROXY'] = proxy
     result = subprocess.run(argv, input=prompt, cwd=destination, env=env, text=True,
                             encoding="utf-8", capture_output=True, timeout=600)
     # Raw provider streams can contain machine metadata: keep them private and bounded.
-    (destination / "provider.log").write_text((result.stdout+result.stderr)[-250000:], encoding="utf-8")
+    exclusive_write(destination / "provider.log", (result.stdout+result.stderr)[-250000:])
     for line in result.stdout.splitlines():
         try:
             event = json.loads(line)
             if event.get("type") == "turn.completed" and "usage" in event:
-                (destination / "usage.json").write_text(json.dumps(event["usage"]), encoding="utf-8")
+                exclusive_write(destination / "usage.json",json.dumps(event["usage"]))
         except (ValueError, AttributeError):
             pass
     if result.returncode:
         raise RuntimeError("Repair provider failed; see private provider.log")
-    return json.loads(answer.read_text(encoding="utf-8"))
+    if answer.is_symlink() or answer.stat().st_size > 200000:
+        raise ValueError('Unsafe or oversized provider answer')
+    descriptor=os.open(answer,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
+    with os.fdopen(descriptor,'r',encoding='utf-8') as incoming:
+        return json.load(incoming)
 
 
 class Remote:
     def __init__(self):
+        import paramiko
         self.cfg = dotenv_values(ROOT / "private/deployment/access.env")
         self.client = paramiko.SSHClient()
         self.client.load_host_keys(str(ROOT / "private/deployment/known_hosts"))
@@ -186,6 +202,24 @@ def once(config):
         return {"status": "paused_uncertain_release"}
     if git("status", "--porcelain") or git("status", "--porcelain", root=Path(config["public_root"])):
         return {"status": "paused_dirty_checkout"}
+    if (PRIVATE/'ledger.sqlite3').exists():
+        previous = Ledger(PRIVATE/'ledger.sqlite3')
+        pending = previous.db.execute("SELECT fingerprint,source FROM attempts WHERE status='claimed' LIMIT 1").fetchone()
+        previous.close()
+        if pending:
+            report = dict(status='paused_interrupted_attempt',fingerprint=pending[0],source=pending[1])
+            (PRIVATE/'reconcile.json').write_text(json.dumps(report))
+            return report
+    # These roots contain only this controller's disposable attempt directories.
+    import re
+    import shutil
+    for root in (PRIVATE/'attempts', Path(config.get('provider_work_root',str(PRIVATE/'provider')))):
+        if root.is_dir() and not root.is_symlink():
+            for path in root.iterdir():
+                if (re.fullmatch(r'\d{10}-[a-f0-9]{16}',path.name) and path.is_dir()
+                        and not path.is_symlink() and path.resolve().parent == root.resolve()
+                        and time.time()-path.stat().st_mtime > 7*86400):
+                    shutil.rmtree(path)
     remote = Remote()
     ledger = None
     try:
@@ -207,6 +241,7 @@ def once(config):
         originals = {}
         published = False
         tested = None
+        usage = {}
         try:
             from maintenance.policy import ALLOWED
             affected = group['details']['location'].split(':', 1)[0]
@@ -214,11 +249,13 @@ def once(config):
                        or k in {"animedl/models.py", "animedl/sites/base.py", "animedl/players/base.py"}}
             destination.mkdir(parents=True)
             provider_dir = Path(config.get("provider_work_root", str(PRIVATE / "provider"))) / destination.name
-            proposal = generate(group, context, config["provider_command"], provider_dir, config.get("provider_user"))
-            import shutil
+            proposal = generate(group, context, config["provider_command"], provider_dir,
+                                config.get("provider_user"), config.get("provider_proxy"))
             for name in ("answer.json", "usage.json", "provider.log"):
                 if (provider_dir / name).exists():
                     shutil.copyfile(provider_dir / name, destination / name)
+            if (destination/'usage.json').exists():
+                usage = json.loads((destination/'usage.json').read_text())
             changes = validate(proposal, original)
             request = remote.put_request(dict(source=source, proposal=proposal))
             tested = remote.call(["prepare", "--request", request], timeout=2400)
@@ -240,7 +277,7 @@ def once(config):
             try:
                 archive = ROOT / "private/repair/reports" / (tested['id'] + '.json')
                 archive.parent.mkdir(parents=True, exist_ok=True)
-                archive.write_text(json.dumps(result | dict(fingerprint=fingerprint, commit=commit), ensure_ascii=False))
+                archive.write_text(json.dumps(result | dict(fingerprint=fingerprint, commit=commit, usage=usage), ensure_ascii=False))
                 with note.open('a', encoding='utf-8') as f:
                     f.write(f"\nРезультат `{tested['id']}`: применён, проверка запуска прошла; commit `{commit}`.\n")
                 sync("Сохранить результат автоисправления: " + fingerprint, config)
@@ -248,7 +285,8 @@ def once(config):
                 (PRIVATE / 'reconcile.json').write_text(json.dumps(dict(status='paused_report_sync', commit=commit)))
             try:
                 remote.notify("✅ Автоисправление парсера применено.\nГруппа: " + fingerprint +
-                              "\nРегрессионный тест, полный набор тестов, CI и проверка запуска прошли.\nCommit: " + commit[:12])
+                              "\nРегрессионный тест, полный набор тестов, CI и проверка запуска прошли.\nCommit: " + commit[:12] +
+                              (f"\nТокены: вход {usage.get('input_tokens', '?')}, выход {usage.get('output_tokens', '?')}" if usage else ''))
             except Exception:
                 (destination / "notification-failed.txt").write_text("Release committed; notification unavailable")
             return result
@@ -273,8 +311,15 @@ def once(config):
                 with (ROOT / 'docs/private/WORKLOG.md').open('a', encoding='utf-8') as f:
                     f.write(f"\nАвтоисправление `{fingerprint}` отклонено или отменено; рабочие исходники восстановлены.\n")
                 sync("Отменить отклонённое автоисправление: " + fingerprint, config)
-            report = dict(status="rejected", reason=type(exc).__name__)
+            report = dict(status="rejected", reason=type(exc).__name__, fingerprint=fingerprint, usage=usage)
             ledger.finish(fingerprint, source, "rejected", report)
+            try:
+                archive=ROOT/'private/repair/reports'/(destination.name+'.json')
+                archive.parent.mkdir(parents=True,exist_ok=True)
+                archive.write_text(json.dumps(report,ensure_ascii=False))
+                sync('Сохранить отклонённое автоисправление: '+fingerprint,config)
+            except Exception:
+                (PRIVATE/'reconcile.json').write_text(json.dumps(dict(status='paused_report_sync',fingerprint=fingerprint)))
             try:
                 remote.notify("⚠ Автоисправление не применено либо отменено.\nГруппа: " + fingerprint +
                               "\nПричина: " + type(exc).__name__ + "\nРабочая версия сохранена. Отчёт — в приватном журнале.")
