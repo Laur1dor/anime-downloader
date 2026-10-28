@@ -47,6 +47,37 @@ class AllohaTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ExtractError, 'время'):
                 await AllohaExtractor().extract('https://alloha.yani.tv/')
 
+    async def test_transient_browser_timeout_reopens_player_and_preserves_1080(self):
+        from playwright.async_api import TimeoutError as BrowserTimeout
+        variants = [VideoVariant(1080, 'https://cdn.example/master.m3u8', direct=True)]
+        with patch.object(AllohaExtractor, '_browser_variants',
+                          AsyncMock(side_effect=[BrowserTimeout('menu timed out'), variants])) as browser:
+            result = await AllohaExtractor().extract('https://alloha.yani.tv/')
+        self.assertEqual(result, variants)
+        self.assertEqual(browser.await_count, 2)
+
+    async def test_network_reset_retries_but_access_error_does_not(self):
+        from playwright.async_api import Error
+        variants = [VideoVariant(1080, 'https://cdn.example/master.m3u8', direct=True)]
+        with patch.object(AllohaExtractor, '_browser_variants',
+                          AsyncMock(side_effect=[Error('net::ERR_CONNECTION_RESET'), variants])) as browser:
+            self.assertEqual(await AllohaExtractor().extract('https://alloha.yani.tv/'), variants)
+            self.assertEqual(browser.await_count, 2)
+        with patch.object(AllohaExtractor, '_browser_variants',
+                          AsyncMock(side_effect=Error('HTTP 403 https://cdn.example/?secret=signed'))) as browser:
+            with self.assertRaises(ExtractError):
+                await AllohaExtractor().extract('https://alloha.yani.tv/')
+            self.assertEqual(browser.await_count, 1)
+
+    async def test_wrong_episode_is_not_retried_and_retry_count_is_bounded(self):
+        from playwright.async_api import TimeoutError as BrowserTimeout
+        for error, count in ((ExtractError('wrong episode'), 1), (BrowserTimeout('menu'), 2)):
+            with self.subTest(error=type(error).__name__), patch.object(
+                    AllohaExtractor, '_browser_variants', AsyncMock(side_effect=error)) as browser:
+                with self.assertRaises(ExtractError):
+                    await AllohaExtractor().extract('https://alloha.yani.tv/')
+                self.assertEqual(browser.await_count, count)
+
 
 if __name__ == '__main__':
     unittest.main()

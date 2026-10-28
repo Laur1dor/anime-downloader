@@ -15,7 +15,7 @@ from ..admin_ops import (delete_media_title, list_media_library, category_ready,
 from ..cache.store import CacheStore
 from ..config import Config
 from ..models import MEDIA_CATEGORIES
-from ..observability import AuditStore
+from ..observability import AuditStore, error_context
 from ..keyboards import LIBRARY_BTN, RELOAD_BTN, SPEED_BTN
 
 log = logging.getLogger(__name__)
@@ -62,10 +62,13 @@ async def cmd_audit_errors(message: Message, cfg: Config, audit: AuditStore) -> 
         await message.answer("В сохранённом журнале нет сгруппированных ошибок.")
         return
     lines = ["⚠ Последние группы ошибок (UTC):", source]
-    for fingerprint, cls, location, count, ts, http in rows:
+    for row in rows:
+        fingerprint, cls, location, count, ts, http = row[:6]
+        context = error_context(*row[6:8]) if len(row) >= 8 else ''
         stamp = datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m %H:%M")
         lines.append(f"{html.escape(cls or 'Error')}{' HTTP ' + str(http) if http else ''} ×{count} · {stamp}\n"
-                     f"{html.escape(location or '')}\nГруппа: {fingerprint}")
+                     f"{html.escape(location or '')}"
+                     f"{chr(10) + context if context else ''}\nГруппа: {fingerprint}")
     await message.answer("\n\n".join(lines))
 
 

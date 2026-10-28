@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import re
 from urllib.parse import parse_qs, urlparse
 
@@ -12,6 +13,16 @@ from ..models import VideoVariant
 from .base import ExtractError, PlayerExtractor
 
 _BROWSER_LOCK = asyncio.Semaphore(1)
+log = logging.getLogger(__name__)
+
+
+def retryable_browser_error(exc: Exception) -> bool:
+    from playwright.async_api import Error, TimeoutError as BrowserTimeout
+    return (isinstance(exc, (asyncio.TimeoutError, BrowserTimeout)) or
+            isinstance(exc, Error) and any(code in str(exc) for code in (
+                'net::ERR_CONNECTION_RESET', 'net::ERR_CONNECTION_CLOSED',
+                'net::ERR_TIMED_OUT', 'net::ERR_EMPTY_RESPONSE',
+                'net::ERR_NETWORK_CHANGED', 'net::ERR_HTTP2_PROTOCOL_ERROR')))
 
 
 def manifest_heights(text: str) -> list[int]:
@@ -45,14 +56,28 @@ class AllohaExtractor(PlayerExtractor):
         url = "https:" + embed_url if embed_url.startswith("//") else embed_url
         try:
             async with _BROWSER_LOCK:
-                return await asyncio.wait_for(self._browser_variants(url), timeout=40)
+                # One total deadline, including cleanup and the fresh browser retry.
+                return await asyncio.wait_for(self._probe_with_retry(url), timeout=40)
         except ExtractError:
             raise
         except asyncio.TimeoutError as exc:
-            raise ExtractError("Alloha: истекло время проверки качества.") from exc
+            error = ExtractError("Alloha: истекло время проверки качества.")
+            error.probe_stage = 'budget'
+            raise error from exc
         except Exception as exc:
             # Browser exceptions can contain signed URLs: never expose their text.
             raise ExtractError(f"Alloha: не удалось открыть плеер ({type(exc).__name__}).") from exc
+
+    async def _probe_with_retry(self, url):
+        for attempt in range(2):
+            try:
+                return await self._browser_variants(url)
+            except Exception as exc:
+                if attempt or not retryable_browser_error(exc):
+                    raise
+                # Do not log browser messages: they can contain signed media URLs.
+                log.info('Alloha: retry quality probe after %s (stage=%s)',
+                         type(exc).__name__, getattr(exc, 'probe_stage', 'browser'))
 
     async def _browser_variants(self, url: str, consume=None):
         from playwright.async_api import async_playwright
@@ -67,6 +92,7 @@ class AllohaExtractor(PlayerExtractor):
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+            stage = 'navigation'
             try:
                 page = await browser.new_page(user_agent=UA)
                 # A normal iframe parent is required by the player. Only this
@@ -92,7 +118,9 @@ class AllohaExtractor(PlayerExtractor):
 
                 page.on("response", on_response)
                 await page.goto(parent, wait_until="domcontentloaded", timeout=15000)
+                stage = 'manifest'
                 await asyncio.wait_for(ready.wait(), timeout=20)
+                stage = 'selection'
                 frame = next((f for f in page.frames if urlparse(f.url).hostname == "alloha.yani.tv"), None)
                 if frame is None:
                     raise ExtractError("Alloha: плеер не открылся.")
@@ -110,25 +138,34 @@ class AllohaExtractor(PlayerExtractor):
                         await item.click(timeout=5000)
                     await controls.first.wait_for(timeout=5000)
 
+                stage = 'quality_menu'
                 await quality_menu()
                 offered = sorted({int(x) for x in await controls.evaluate_all("nodes => nodes.map(n => n.value)")}, reverse=True)
                 for height in offered:
                     if height in variants:
                         continue
                     changed.clear()
+                    stage = 'quality_switch'
                     await frame.locator(f'[data-allplay="quality"][value="{height}"]').click(timeout=3000)
                     while height not in variants:
                         await asyncio.wait_for(changed.wait(), timeout=5)
                         changed.clear()
                     # Selecting a quality returns to the main settings menu.
                     if height != offered[-1]:
+                        stage = 'quality_menu'
                         await quality_menu()
                 if not variants:
                     raise ExtractError("Alloha: нет проверенных вариантов качества.")
                 if consume is not None:
+                    stage = 'media_download'
                     return await consume(frame, [variants[h] for h in sorted(variants, reverse=True)])
                 return [variants[h] for h in sorted(variants, reverse=True)]
+            except Exception as exc:
+                exc.probe_stage = stage
+                raise
             finally:
                 for task in pending:
                     task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 await browser.close()

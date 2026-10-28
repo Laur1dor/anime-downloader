@@ -26,7 +26,21 @@ _current = None
 _user = ContextVar("audit_user", default=None)
 _FIELDS = {"site", "title", "provider", "voice", "quality", "delivery", "category",
            "episode", "season", "bytes", "telegram", "library", "state", "choice",
-           "duration_ms", "error_class", "location", "fingerprint", "job_id", "source_failed", "http_status"}
+           "duration_ms", "error_class", "location", "fingerprint", "job_id", "source_failed", "http_status",
+           "cause_class", "cause_location", "stage"}
+_STAGES = {'navigation': 'открытие плеера', 'manifest': 'ожидание HLS',
+           'selection': 'проверка серии и озвучки', 'quality_menu': 'меню качества',
+           'quality_switch': 'переключение качества', 'media_download': 'загрузка видео',
+           'budget': 'общий лимит времени'}
+
+
+def error_context(cause_class=None, stage=None):
+    parts = []
+    if stage in _STAGES:
+        parts.append('Этап: ' + _STAGES[stage])
+    if cause_class:
+        parts.append('Причина: ' + html.escape(cause_class))
+    return ' · '.join(parts)
 _SQL = """CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, user_id BIGINT,
     action TEXT NOT NULL, status TEXT NOT NULL, details JSONB NOT NULL);
@@ -57,22 +71,32 @@ def error_details(exc):
     location = f"{Path(frame.filename).name}:{frame.name}:{frame.lineno}" if frame else "unknown"
     cls = type(exc).__name__
     status = None
+    cause_class = cause_location = stage = None
     current, seen = exc, set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if stage is None and getattr(current, 'probe_stage', None) in _STAGES:
+            stage = current.probe_stage
+        if current is not exc and not isinstance(current, asyncio.CancelledError):
+            cause_class = type(current).__name__
+            trace = traceback.extract_tb(current.__traceback__)
+            last = trace[-1] if trace else None
+            cause_location = f'{Path(last.filename).name}:{last.name}:{last.lineno}' if last else 'unknown'
         response = getattr(current, "response", None)
         candidate = getattr(response, "status_code", None)
-        if isinstance(candidate, int) and 100 <= candidate <= 599:
+        if status is None and isinstance(candidate, int) and 100 <= candidate <= 599:
             status = candidate
-            break
         match = re.search(r"HTTP(?:\s+error)?\s*[: ]\s*([45]\d\d)\b", str(current)[:2000], re.I)
-        if match:
+        if match and status is None:
             status = int(match[1])
-            break
         current = current.__cause__ or current.__context__
-    return {"error_class": cls, "location": location,
+    signature = f"{cls}:{status}:{location}"
+    if cause_class or stage:
+        signature += f':{cause_class}:{stage}'
+    return {"error_class": cls, "location": location, "cause_class": cause_class,
+            "cause_location": cause_location, "stage": stage,
             "http_status": status,
-            "fingerprint": hashlib.sha256(f"{cls}:{status}:{location}".encode()).hexdigest()[:16]}
+            "fingerprint": hashlib.sha256(signature.encode()).hexdigest()[:16]}
 
 
 def emit(action, user_id=None, status="ok", **details):
@@ -207,6 +231,8 @@ class AuditStore:
                     html.escape(details.get("error_class", "Error")) + "\n" +
                     (f"HTTP {details['http_status']}\n" if details.get("http_status") else "") +
                     html.escape(details.get("location", "")) +
+                    ('\n' + error_context(details.get('cause_class'), details.get('stage'))
+                     if details.get('cause_class') or details.get('stage') else '') +
                     "\nГруппа: " + fingerprint + "\nПодробнее: /errors")
             try:
                 await asyncio.wait_for(self.notifier(text), timeout=5)
@@ -250,7 +276,8 @@ class AuditStore:
     def errors(self):
         rows = self.db.execute("""SELECT json_extract(details,'$.fingerprint'),
             json_extract(details,'$.error_class'),json_extract(details,'$.location'),
-            COUNT(*),MAX(ts),json_extract(details,'$.http_status') FROM audit_events WHERE status='error'
+            COUNT(*),MAX(ts),json_extract(details,'$.http_status'),
+            json_extract(details,'$.cause_class'),json_extract(details,'$.stage') FROM audit_events WHERE status='error'
             AND json_extract(details,'$.fingerprint') IS NOT NULL
             GROUP BY json_extract(details,'$.fingerprint') ORDER BY MAX(ts) DESC LIMIT 12""").fetchall()
         return rows
@@ -283,9 +310,10 @@ class AuditStore:
             try:
                 async with self.pool.acquire() as conn:
                     rows = await conn.fetch("""SELECT details->>'fingerprint',details->>'error_class',
-                        details->>'location',COUNT(*),MAX(ts),details->>'http_status'
+                        details->>'location',COUNT(*),MAX(ts),details->>'http_status',
+                        details->>'cause_class',details->>'stage'
                         FROM audit_events WHERE status='error' AND details->>'fingerprint' IS NOT NULL
-                        GROUP BY 1,2,3,6 ORDER BY MAX(ts) DESC LIMIT 12""")
+                        GROUP BY 1,2,3,6,7,8 ORDER BY MAX(ts) DESC LIMIT 12""")
                 return rows, f"PostgreSQL, до {self.pg_max_events} событий / {self.retention_days} дн."
             except Exception as exc:
                 log.warning("Audit errors use local fallback (%s)", type(exc).__name__)

@@ -52,6 +52,31 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.stats()["total"], 100)
         self.assertEqual(self.store.stats()["dropped"], 1)
 
+    async def test_wrapped_browser_error_preserves_safe_cause_and_stage_in_reports(self):
+        from animedl.players.base import ExtractError
+        try:
+            try:
+                error = TimeoutError('https://cdn.example/?secret=PRIVATE')
+                error.probe_stage = 'quality_menu'
+                raise error
+            except TimeoutError as cause:
+                raise ExtractError('browser failed') from cause
+        except ExtractError as error:
+            details = audit.error_details(error)
+        self.assertEqual(details['cause_class'], 'TimeoutError')
+        self.assertEqual(details['stage'], 'quality_menu')
+        self.store.record('quality_probe_error',1,'error',**details)
+        raw=self.store.db.execute('SELECT details FROM audit_events').fetchone()[0]
+        self.assertNotIn('PRIVATE',raw)
+        rows,_=await self.store.error_report()
+        self.assertEqual(tuple(rows[0][6:]),('TimeoutError','quality_menu'))
+        message=SimpleNamespace(from_user=SimpleNamespace(id=1),answer=AsyncMock())
+        await cmd_audit_errors(message,SimpleNamespace(admin_id=1),self.store)
+        text=message.answer.call_args.args[0]
+        self.assertIn('меню качества',text)
+        self.assertIn('Причина: TimeoutError',text)
+        self.assertNotIn('PRIVATE',text)
+
     def test_retention_and_finished_episode_stats(self):
         self.store.record("episode_finished", 4, "sent_new", bytes=1024, title="Movie")
         self.store.record("episode_finished", 5, "error", bytes=0)
