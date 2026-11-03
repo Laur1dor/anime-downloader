@@ -67,7 +67,7 @@ def _parse_episodes(html: str) -> dict[int, tuple[str, str]]:
     soup = BeautifulSoup(html, "lxml")
     eps: dict[int, tuple[str, str]] = {}
     for o in soup.select("option[data-hash]"):
-        if o.get("data-translation-type"):
+        if o.get("data-translation-type") or _other_translation(o):
             continue
         sid, shash = o.get("data-id"), o.get("data-hash")
         if not sid or not shash:
@@ -81,12 +81,20 @@ def _parse_episodes(html: str) -> dict[int, tuple[str, str]]:
     return eps
 
 
+def _other_translation(option) -> bool:
+    """Kodik fills missing episodes with another dub; never label those as ours."""
+    marker = str(option.get("data-other-translation", "")).strip().lower()
+    label = str(option.get("data-title", "")) + " " + option.get_text(" ", strip=True)
+    return marker not in ("", "false", "0") or bool(
+        re.search(r"другой\s+перевод\s*:", label, re.I))
+
+
 def _parse_episode_titles(html: str) -> dict[int, str]:
     """Keep named Kodik episodes; ordinary numbered options are not names."""
     soup = BeautifulSoup(html, "lxml")
     titles: dict[int, str] = {}
     for option in soup.select("option[data-hash][data-id]"):
-        if option.get("data-translation-type"):
+        if option.get("data-translation-type") or _other_translation(option):
             continue
         try:
             number = int(option.get("value") or 0)

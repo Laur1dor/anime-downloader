@@ -154,4 +154,8 @@ def validate_library_details(title: str | None, season: int | None, season_name:
 def make_cache_hash(site: str, anime_id: str, episode: int,
                     voice: str, provider: str, quality: int) -> str:
     raw = f"{site}|{anime_id}|{episode}|{voice}|{provider}|{quality}"
+    # Old Yummy entries could contain Kodik's automatic replacement dub,
+    # including recovery entries saved before the actual provider was chosen.
+    if site == "yummyanime":
+        raw += "|strict-voice:1"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
