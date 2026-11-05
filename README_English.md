@@ -4,6 +4,8 @@
 
 A Telegram bot for downloading supported anime and TV sources, with optional delivery to the owner's Jellyfin library. Choose a voice track, episodes and quality; provider selection is automatic. Source families include AnimeGO, YummyAnime and a dedicated Sopranos source. Individual players, regional availability and metadata coverage vary.
 
+Search shows five results per page with numbered buttons, typed selection, back navigation and cancellation in the same bot message. Blocking the bot stops that chat's task and remaining episodes; a forbidden cached send never triggers a fresh download.
+
 ## Docker setup
 
 Use Linux, Docker Engine and Compose v2. Copy `.env.example` to `.env`, then supply `BOT_TOKEN`, `ADMIN_ID`, `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`. Start privately with `ACCESS_MODE=admin` and one concurrent job:

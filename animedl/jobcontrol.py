@@ -7,6 +7,7 @@ import asyncio
 class JobControl:
     def __init__(self) -> None:
         self.cancelled = False
+        self.recipient_unavailable = False
         self._resume = asyncio.Event()
         self._resume.set()  # по умолчанию — не на паузе
 
@@ -19,6 +20,10 @@ class JobControl:
     def cancel(self) -> None:
         self.cancelled = True
         self._resume.set()  # разблокируем ожидание паузы, чтобы отмена сработала
+
+    def stop_forbidden(self) -> None:
+        self.recipient_unavailable = True
+        self.cancel()
 
     @property
     def is_paused(self) -> bool:

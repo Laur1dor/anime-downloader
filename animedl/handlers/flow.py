@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -11,11 +12,11 @@ from ..cache.store import CacheStore
 from ..catalog import CatalogStore
 from ..admin_ops import category_ready
 from ..config import Config
-from ..observability import capture
+from ..observability import capture, emit
 from ..fsm.states import DownloadFlow
 from ..jobcontrol import (end_job, get_job, global_semaphore, is_busy, start_job)
 from ..keyboards import (category_kb, confirm_kb, delivery_kb, library_details_kb, episodes_kb, job_kb, providers_kb, quality_kb,
-                         seasons_kb, voices_kb)
+                         seasons_kb, voices_kb, search_back_kb)
 from ..models import MEDIA_CATEGORIES, is_movie, EpisodeRef, PlayerButton, TitleInfo, library_selection_suggestion, validate_library_details
 from ..players.base import ExtractError
 from ..services import (EpisodeResult, group_voices, process_episode, providers_for_voice,
@@ -68,19 +69,35 @@ def parse_selection(text: str, total: int) -> list[int]:
 
 @router.message(F.text.contains("http"))
 async def on_link(message: Message, state: FSMContext, catalog: CatalogStore | None = None) -> None:
+    if get_job(message.chat.id):
+        await message.answer("Дождись завершения загрузки или останови её кнопкой «Стоп».")
+        return
+    await state.clear()
     url = message.text.strip().split()[0]
     await open_title(message, state, url, catalog)
 
 
+async def _flow_reply(message: Message, state: FSMContext, text: str, **kwargs):
+    data = await state.get_data()
+    if data.get('search_message_id'):
+        return await message.bot.edit_message_text(text, chat_id=message.chat.id,
+                                                  message_id=data['search_message_id'], **kwargs)
+    return await message.answer(text, **kwargs)
+
+
 async def open_title(message: Message, state: FSMContext, url: str,
-                     catalog: CatalogStore | None = None) -> None:
+                     catalog: CatalogStore | None = None, *, status: Message | None = None) -> None:
     try:
         parser = get_parser(url)
     except UnsupportedSite as e:
         await message.answer(f"⚠ {e}")
         return
 
-    status = await message.answer("🔎 Определяю тайтл и озвучки…")
+    if status is None:
+        status = await message.answer("🔎 Определяю тайтл и озвучки…")
+    else:
+        await status.edit_text("🔎 Определяю тайтл и озвучки…", reply_markup=None)
+    search_data = await state.get_data()
     try:
         title = await parser.fetch_title(url)
         if catalog is not None:
@@ -98,7 +115,7 @@ async def open_title(message: Message, state: FSMContext, url: str,
             await state.set_state(DownloadFlow.choosing_season)
             import html
             await status.edit_text(f"🎬 <b>{html.escape(title.title)}</b>\nВыбери сезон или весь сериал:",
-                                   reply_markup=seasons_kb(seasons, title.season))
+                                   reply_markup=search_back_kb(seasons_kb(seasons, title.season), search_data))
             return
         ref_ep = title.episodes[0]
         buttons = await parser.fetch_episode_players(title, ref_ep)
@@ -107,7 +124,7 @@ async def open_title(message: Message, state: FSMContext, url: str,
         await status.edit_text(f"⚠ {e}")
         return
     except Exception as e:  # noqa: BLE001
-        capture(e, "title_parse_error", message.from_user.id if message.from_user else None)
+        capture(e, "title_parse_error")
         log.exception("Ошибка разбора тайтла")
         await status.edit_text(f"⚠ Не удалось разобрать страницу: {e}")
         return
@@ -134,7 +151,7 @@ async def open_title(message: Message, state: FSMContext, url: str,
         f"🎬 <b>{title.title}</b>\n"
         f"Серий доступно: {len(title.episodes)}\n\n"
         f"Выбери озвучку:",
-        reply_markup=voices_kb(list(voices.keys())),
+        reply_markup=search_back_kb(voices_kb(list(voices.keys())), search_data),
     )
 
 
@@ -175,7 +192,7 @@ async def on_season(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(DownloadFlow.choosing_voice)
     scope = "Весь сериал" if season is None else f"Сезон {season}"
     await cq.message.edit_text(f"{scope} · {len(episodes)} серий\nВыбери озвучку:",
-        reply_markup=voices_kb(voices, preferred, has_seasons=True))
+        reply_markup=search_back_kb(voices_kb(voices, preferred, has_seasons=True), data))
     await cq.answer()
 
 
@@ -274,7 +291,7 @@ async def on_range_text(message: Message, state: FSMContext) -> None:
     except (ValueError, TypeError):
         hint = (f"Введи один номер от 1 до {total}." if mode == "from"
                 else "Пример: <code>3-7</code> или <code>1,4,9</code>.")
-        await message.answer(f"Не понял. {hint}")
+        await _flow_reply(message, state, f"Не понял. {hint}")
         return
     await state.update_data(ep_numbers=nums)
     await _ask_quality_msg(message, state)
@@ -334,7 +351,7 @@ async def _ask_quality(cq: CallbackQuery, state: FSMContext) -> None:
 
 
 async def _ask_quality_msg(message: Message, state: FSMContext) -> None:
-    status = await message.answer("⏳ Получаю доступные качества…")
+    status = await _flow_reply(message, state, "⏳ Получаю доступные качества…")
     try:
         qs = await _resolve_quality_options(state)
     except (ExtractError, ParseError) as e:
@@ -497,14 +514,14 @@ async def on_library_details_text(message: Message, state: FSMContext, cfg: Conf
             season = int(raw_season) if numeric else None
             season_name = "" if numeric else raw_season
             if data.get("seasons") and (season != data.get("season") or season_name):
-                await message.answer("Номер сезона берётся из источника. Оставь его прежним и измени название сериала.")
+                await _flow_reply(message, state, "Номер сезона берётся из источника. Оставь его прежним и измени название сериала.")
                 return
         validate_library_details(name, season, season_name, category)
     except (ValueError, TypeError):
-        await message.answer("Введи название или номер сезона и сериал: <code>Бедствие | Блич</code> или <code>2 | One Room</code>.")
+        await _flow_reply(message, state, "Введи название или номер сезона и сериал: <code>Бедствие | Блич</code> или <code>2 | One Room</code>.")
         return
     await state.update_data(library_season=season, library_season_name=season_name, library_title=name)
-    status = await message.answer("Проверяю параметры…")
+    status = await _flow_reply(message, state, "Проверяю параметры…")
     await _show_confirmation(status, state)
 
 
@@ -578,9 +595,14 @@ async def on_go(cq: CallbackQuery, state: FSMContext, bot: Bot,
     status = cq.message
 
     async def on_status(text: str) -> None:
+        if ctrl.recipient_unavailable:
+            return
         suffix = "\n\n⏸ На паузе" if ctrl.is_paused else ""
         try:
             await status.edit_text(text + suffix, reply_markup=job_kb(ctrl.is_paused))
+        except TelegramForbiddenError as exc:
+            ctrl.stop_forbidden()
+            capture(exc, "telegram_error", cq.from_user.id, title=title.title, site=title.site)
         except Exception:  # not modified / flood — не критично
             pass
 
@@ -634,7 +656,8 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
             capture(e, "episode_unhandled_error", user_id, title=title.title, site=title.site,
                     episode=ep.number, provider=provider, quality=quality)
             log.exception("Ошибка обработки серии %s", ep.number)
-            return EpisodeResult(ep.number, "error", note=str(e), season=ep.season)
+            return EpisodeResult(ep.number, "error", note=str(e), season=ep.season,
+                                 telegram_forbidden=isinstance(e, TelegramForbiddenError))
 
     for n in nums:
         # пауза между сериями (даёт возможность продолжить/отменить)
@@ -654,6 +677,12 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
         results.append(res)
         result_numbers.append(n)
         done += 1
+        if res.telegram_forbidden:
+            ctrl.cancelled = True
+            if hasattr(ctrl, 'stop_forbidden'):
+                ctrl.stop_forbidden()
+            emit("batch_stopped", user_id, "cancelled", reason="telegram_forbidden", title=title.title)
+            break
         if res.status == "cancelled" or ctrl.cancelled:
             break
 
@@ -679,10 +708,18 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
                 if recovered.status != "cancelled":
                     recovered.status = "sent_new" if recovered.library == "saved" else "partial"
             results[i] = recovered
+            if recovered.telegram_forbidden:
+                ctrl.cancelled = True
+                if hasattr(ctrl, 'stop_forbidden'):
+                    ctrl.stop_forbidden()
+                emit("batch_stopped", user_id, "cancelled", reason="telegram_forbidden", title=title.title)
+                break
             if recovered.status == "cancelled" or ctrl.cancelled:
                 break
 
     # Report each selected delivery channel, including partial success.
+    if getattr(ctrl, 'recipient_unavailable', False) or any(r.telegram_forbidden for r in results):
+        return []
     import html
     was_cancelled = ctrl.cancelled or any(r.status == "cancelled" for r in results)
     failures = [r for r in results if r.status in ("error", "partial")]
@@ -764,7 +801,7 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext) -> None:
 async def back_voice(cq: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await state.set_state(DownloadFlow.choosing_voice)
-    await cq.message.edit_text("Выбери озвучку:", reply_markup=voices_kb(data["voices"], data.get("preferred_voice", ""), has_seasons=bool(data.get("seasons"))))
+    await cq.message.edit_text("Выбери озвучку:", reply_markup=search_back_kb(voices_kb(data["voices"], data.get("preferred_voice", ""), has_seasons=bool(data.get("seasons"))), data))
     await cq.answer()
 
 
@@ -775,5 +812,5 @@ async def back_season(cq: CallbackQuery, state: FSMContext) -> None:
         await cq.answer("Сезоны недоступны")
         return
     await state.set_state(DownloadFlow.choosing_season)
-    await cq.message.edit_text("Выбери сезон или весь сериал:", reply_markup=seasons_kb(data["seasons"], data.get("season")))
+    await cq.message.edit_text("Выбери сезон или весь сериал:", reply_markup=search_back_kb(seasons_kb(data["seasons"], data.get("season")), data))
     await cq.answer()

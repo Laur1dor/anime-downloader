@@ -10,6 +10,14 @@ SPEED_BTN = "⚙ Скорость"
 LIBRARY_BTN = "📁 Библиотека"
 
 
+def search_back_kb(markup: InlineKeyboardMarkup, data: dict) -> InlineKeyboardMarkup:
+    if not data.get('search_token'):
+        return markup
+    button = InlineKeyboardButton(text="« Результаты поиска",
+        callback_data=f"search:page:{data['search_token']}:{data.get('search_page', 0)}")
+    return InlineKeyboardMarkup(inline_keyboard=[*markup.inline_keyboard, [button]])
+
+
 def admin_reply_kb() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура у поля ввода — только для админа."""
     return ReplyKeyboardMarkup(

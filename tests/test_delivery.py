@@ -18,6 +18,25 @@ from animedl.handlers.flow import (on_category, on_delivery, on_quality, on_go, 
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forbidden_cached_send_never_falls_back_to_download(self):
+        from aiogram.exceptions import TelegramForbiddenError
+        from aiogram.methods import SendVideo
+        self.cache.get.return_value = 'cached'
+        self.cached.side_effect = TelegramForbiddenError(method=SendVideo(chat_id=1,video='cached'),message='bot was blocked by the user')
+        result=await self.run_episode()
+        self.assertTrue(result.telegram_forbidden)
+        self.assertEqual(result.telegram,'error')
+        self.download.assert_not_awaited()
+        self.upload.assert_not_awaited()
+
+    async def test_forbidden_upload_preserves_current_library_file(self):
+        from aiogram.exceptions import TelegramForbiddenError
+        from aiogram.methods import SendVideo
+        self.upload.side_effect=TelegramForbiddenError(method=SendVideo(chat_id=1,video='file'),message='bot was blocked by the user')
+        result=await self.run_episode('both')
+        self.assertTrue(result.telegram_forbidden)
+        self.assertEqual((result.status,result.library),('partial','saved'))
+        self.assertEqual(len(list(self.library.rglob('*.mp4'))),1)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

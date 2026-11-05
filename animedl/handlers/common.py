@@ -4,12 +4,24 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import Message, ChatMemberUpdated
 
 from ..config import Config
 from ..keyboards import admin_reply_kb
+from ..jobcontrol import get_job
+from ..observability import emit
+from ..catalog import CatalogStore
 
 router = Router()
+
+
+@router.my_chat_member()
+async def on_bot_membership(event: ChatMemberUpdated) -> None:
+    if event.chat.type == "private" and event.new_chat_member.status in ("kicked", "left"):
+        ctrl = get_job(event.chat.id)
+        if ctrl:
+            ctrl.stop_forbidden()
+            emit("batch_stopped", event.chat.id, "cancelled", reason="telegram_forbidden")
 
 HELP = (
     "🎬 <b>AnimeDownloader</b>\n\n"
@@ -44,6 +56,13 @@ async def cmd_help(message: Message) -> None:
 
 
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
+async def cmd_cancel(message: Message, state: FSMContext, catalog: CatalogStore | None = None) -> None:
+    data = await state.get_data()
+    if catalog and message.from_user and data.get('search_token'):
+        catalog.discard_results(message.from_user.id, data['search_token'])
     await state.clear()
-    await message.answer("Отменено. Пришли новую ссылку, когда будешь готов.")
+    if data.get('search_message_id') and not get_job(message.chat.id):
+        await message.bot.edit_message_text("Поиск и выбор отменены. Пришли ссылку или название.",
+            chat_id=message.chat.id, message_id=data['search_message_id'], reply_markup=None)
+    else:
+        await message.answer("Отменено. Пришли новую ссылку, когда будешь готов.")

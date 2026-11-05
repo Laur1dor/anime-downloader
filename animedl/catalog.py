@@ -125,9 +125,14 @@ class CatalogStore:
         token = secrets.token_hex(8)
         with self.db:
             self.db.execute("DELETE FROM sessions WHERE expires_at<=?", (time.time(),))
+            self.db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
             self.db.execute("INSERT INTO sessions VALUES (?,?,?,?)",
                             (token, user_id, json.dumps(results, ensure_ascii=False), time.time() + self.SESSION_TTL))
         return token
+
+    def discard_results(self, user_id: int, token: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE token=? AND user_id=?", (token, user_id))
 
     def get_result(self, user_id: int, token: str, index: int) -> CatalogHit | None:
         if type(index) is not int or index < 0:
@@ -142,6 +147,14 @@ class CatalogStore:
         data = results[index]
         data["aliases"] = tuple(data["aliases"])
         return CatalogHit(**data)
+
+    def get_results(self, user_id: int, token: str) -> list[CatalogHit]:
+        row = self.db.execute("SELECT results FROM sessions WHERE token=? AND user_id=? AND expires_at>?",
+                              (token, user_id, time.time())).fetchone()
+        if not row:
+            return []
+        return [CatalogHit(**(data | {'aliases': tuple(data['aliases'])}))
+                for data in json.loads(row['results'])]
 
     def event(self, user_id: int, action: str, site: str = "", **details) -> None:
         # Intentionally exclude queries, URLs, tokens, messages and arbitrary details.

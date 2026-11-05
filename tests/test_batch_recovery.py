@@ -8,6 +8,18 @@ from animedl.services import EpisodeResult
 
 
 class BatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forbidden_recipient_stops_entire_batch_without_source_retries(self):
+        from animedl.jobcontrol import JobControl
+        ctrl=JobControl()
+        processor, summary, _=await self.run_batch(
+            lambda **kw: EpisodeResult(kw['episode'].number,'error',telegram='error',
+                                      telegram_forbidden=True,source_failed=True),
+            ctrl=ctrl,delivery='telegram')
+        processor.assert_awaited_once()
+        self.assertTrue(ctrl.cancelled)
+        self.assertTrue(ctrl.recipient_unavailable)
+        self.assertEqual(summary,'')
+
     async def run_batch(self, process, *, ctrl=None, episodes=None, nums=None, delivery="library"):
         episodes = episodes or {1: EpisodeRef(1, "s1e1", season=1),
                                 2: EpisodeRef(1, "s2e1", season=2)}
@@ -19,7 +31,23 @@ class BatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
                               episodes, nums or list(episodes), "Voice", "Kodik", 1080,
                               ctrl, 1, status, progress, user_id=42, delivery=delivery,
                               library_title="Title", library_category="series")
-        return processor, status.edit_text.call_args.args[0], progress
+        return processor, status.edit_text.call_args.args[0] if status.edit_text.call_args else '', progress
+
+    async def test_block_event_cancels_queued_or_paused_chat_only(self):
+        from animedl.jobcontrol import start_job,end_job
+        from animedl.handlers.common import on_bot_membership
+        blocked=start_job(17);other=start_job(18);blocked.pause()
+        try:
+            await on_bot_membership(SimpleNamespace(chat=SimpleNamespace(id=17,type='private'),
+                new_chat_member=SimpleNamespace(status='kicked')))
+            self.assertTrue(blocked.cancelled)
+            self.assertFalse(blocked.is_paused)
+            self.assertFalse(other.cancelled)
+            await on_bot_membership(SimpleNamespace(chat=SimpleNamespace(id=18,type='group'),
+                new_chat_member=SimpleNamespace(status='kicked')))
+            self.assertFalse(other.cancelled)
+        finally:
+            end_job(17);end_job(18)
 
     async def test_only_failed_source_retried_after_others_with_same_selection(self):
         calls = []

@@ -20,7 +20,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramForbiddenError
 
 from .admin_ops import ArchiveOutcome, archive_to_library, category_ready, library_ready
 from .artwork import download_poster, create_episode_thumbnail
@@ -108,6 +108,7 @@ class EpisodeResult:
     library: str = "skipped"
     season: int | None = None
     source_failed: bool = False
+    telegram_forbidden: bool = False
 
 
 def group_voices(buttons: list[PlayerButton]) -> "OrderedDict[str, list[PlayerButton]]":
@@ -236,6 +237,12 @@ async def process_episode(
                 suffix = f" • часть {i}/{len(ids)}" if len(ids) > 1 else ""
                 await send_video_by_id(bot, chat_id, item, caption=caption + suffix)
             res.telegram = "cached"
+        except TelegramForbiddenError as e:
+            res.telegram = "error"
+            res.telegram_forbidden = True
+            capture(e, "telegram_error", user_id, job_id=audit_job, title=title.title,
+                    site=title.site, provider=provider, quality=quality, episode=episode.number)
+            notes.append("Telegram запретил отправку в чат; дальнейшая загрузка остановлена")
         except Exception as e:
             res.telegram = "skipped"
             notes.append(f"Кэш Telegram недоступен, отправляю заново: {e}")
@@ -264,6 +271,8 @@ async def process_episode(
                 break
     if cached:
         await cached_send(cached)
+        if res.telegram_forbidden:
+            return finish()
         if not wants_library and res.telegram == "cached":
             return finish()
 
@@ -499,14 +508,16 @@ async def process_episode(
                         log.warning("Telegram cache write failed (%s)", type(e).__name__)
             except Exception as e:
                 res.telegram = "error"
+                res.telegram_forbidden = isinstance(e, TelegramForbiddenError)
                 capture(e, "telegram_error", user_id, job_id=audit_job, title=title.title,
                         site=title.site, provider=provider, quality=quality, episode=episode.number)
-                notes.append("Telegram: отправка отменена; уже принятые видео могут прийти позже" if isinstance(e, DownloadCancelled)
+                notes.append("Telegram запретил отправку в чат; дальнейшая загрузка остановлена" if res.telegram_forbidden
+                             else "Telegram: отправка отменена; уже принятые видео могут прийти позже" if isinstance(e, DownloadCancelled)
                              else "Telegram не подтвердил отправку; видео может прийти позже. Проверь чат перед повтором"
                              if isinstance(e, (TelegramNetworkError, TelegramServerError))
                              else f"Telegram: {e}" if isinstance(e, ValueError)
                              else f"Telegram: {type(e).__name__}: отправка не завершена")
-        if recovery:
+        if recovery and not res.telegram_forbidden:
             try:
                 if (wants_tg and res.telegram == "error") or (wants_library and res.library == "error"):
                     if recovered or await asyncio.to_thread(recovery.save, recovery_key, result, provider, variant.quality):
