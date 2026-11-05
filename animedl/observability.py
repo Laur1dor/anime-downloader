@@ -20,6 +20,7 @@ from pathlib import Path
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery
+from .error_messages import error_reason, format_error_alert
 
 log = logging.getLogger(__name__)
 _current = None
@@ -27,7 +28,7 @@ _user = ContextVar("audit_user", default=None)
 _FIELDS = {"site", "title", "provider", "voice", "quality", "delivery", "category",
            "episode", "season", "bytes", "telegram", "library", "state", "choice",
            "duration_ms", "error_class", "location", "fingerprint", "job_id", "source_failed", "http_status",
-           "cause_class", "cause_location", "stage"}
+           "cause_class", "cause_location", "stage", "reason"}
 _STAGES = {'navigation': 'открытие плеера', 'manifest': 'ожидание HLS',
            'selection': 'проверка серии и озвучки', 'quality_menu': 'меню качества',
            'quality_switch': 'переключение качества', 'media_download': 'загрузка видео',
@@ -71,10 +72,11 @@ def error_details(exc):
     location = f"{Path(frame.filename).name}:{frame.name}:{frame.lineno}" if frame else "unknown"
     cls = type(exc).__name__
     status = None
-    cause_class = cause_location = stage = None
+    cause_class = cause_location = stage = reason = None
     current, seen = exc, set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        reason = reason or error_reason(current)
         if stage is None and getattr(current, 'probe_stage', None) in _STAGES:
             stage = current.probe_stage
         if current is not exc and not isinstance(current, asyncio.CancelledError):
@@ -93,9 +95,11 @@ def error_details(exc):
     signature = f"{cls}:{status}:{location}"
     if cause_class or stage:
         signature += f':{cause_class}:{stage}'
+    if reason:
+        signature += ':' + reason
     return {"error_class": cls, "location": location, "cause_class": cause_class,
             "cause_location": cause_location, "stage": stage,
-            "http_status": status,
+            "http_status": status, "reason": reason,
             "fingerprint": hashlib.sha256(signature.encode()).hexdigest()[:16]}
 
 
@@ -171,10 +175,11 @@ class AuditStore:
         self._count = self.db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         self._last_prune = time.time()
 
-    async def start(self, notifier=None):
+    async def start(self, notifier=None, *, owner_id=None):
         global _current
         _current = self
         self.notifier = notifier
+        self.owner_id = owner_id
         self.task = asyncio.create_task(self._worker(), name="audit-mirror")
 
     async def close(self):
@@ -212,12 +217,12 @@ class AuditStore:
 
     async def _alerts(self):
         now = time.time()
-        rows = self.db.execute("SELECT ts,action,details FROM audit_events WHERE status='error' AND ts>? ORDER BY ts LIMIT 100",
+        rows = self.db.execute("SELECT ts,action,details,user_id FROM audit_events WHERE status='error' AND ts>? ORDER BY ts LIMIT 100",
                                (self._last_alert_scan,)).fetchall()
         self._last_alert_scan = now
         if not self.notifier:
             return
-        for ts, action, raw in rows:
+        for ts, action, raw, uid in rows:
             details = json.loads(raw)
             fingerprint = details.get("fingerprint")
             if not fingerprint:
@@ -227,13 +232,9 @@ class AuditStore:
                 continue
             self.db.execute("INSERT OR REPLACE INTO audit_alerts VALUES (?,?)", (fingerprint, now))
             self.db.commit()
-            text = ("⚠ Ошибка загрузчика\n" + html.escape(action) + ": " +
-                    html.escape(details.get("error_class", "Error")) + "\n" +
-                    (f"HTTP {details['http_status']}\n" if details.get("http_status") else "") +
-                    html.escape(details.get("location", "")) +
-                    ('\n' + error_context(details.get('cause_class'), details.get('stage'))
-                     if details.get('cause_class') or details.get('stage') else '') +
-                    "\nГруппа: " + fingerprint + "\nПодробнее: /errors")
+            owner_id = getattr(self, 'owner_id', None)
+            scope = ('Твоя задача.' if uid == owner_id else 'Задача другого пользователя.') if uid is not None and owner_id is not None else ''
+            text = format_error_alert(action, details, scope=scope)
             try:
                 await asyncio.wait_for(self.notifier(text), timeout=5)
             except Exception:
@@ -277,9 +278,10 @@ class AuditStore:
         rows = self.db.execute("""SELECT json_extract(details,'$.fingerprint'),
             json_extract(details,'$.error_class'),json_extract(details,'$.location'),
             COUNT(*),MAX(ts),json_extract(details,'$.http_status'),
-            json_extract(details,'$.cause_class'),json_extract(details,'$.stage') FROM audit_events WHERE status='error'
+            json_extract(details,'$.cause_class'),json_extract(details,'$.stage'),
+            json_extract(details,'$.reason'),action FROM audit_events WHERE status='error'
             AND json_extract(details,'$.fingerprint') IS NOT NULL
-            GROUP BY json_extract(details,'$.fingerprint') ORDER BY MAX(ts) DESC LIMIT 12""").fetchall()
+            GROUP BY json_extract(details,'$.fingerprint'),action ORDER BY MAX(ts) DESC LIMIT 12""").fetchall()
         return rows
 
     async def report(self):
@@ -311,9 +313,9 @@ class AuditStore:
                 async with self.pool.acquire() as conn:
                     rows = await conn.fetch("""SELECT details->>'fingerprint',details->>'error_class',
                         details->>'location',COUNT(*),MAX(ts),details->>'http_status',
-                        details->>'cause_class',details->>'stage'
+                        details->>'cause_class',details->>'stage',details->>'reason',action
                         FROM audit_events WHERE status='error' AND details->>'fingerprint' IS NOT NULL
-                        GROUP BY 1,2,3,6,7,8 ORDER BY MAX(ts) DESC LIMIT 12""")
+                        GROUP BY 1,2,3,6,7,8,9,10 ORDER BY MAX(ts) DESC LIMIT 12""")
                 return rows, f"PostgreSQL, до {self.pg_max_events} событий / {self.retention_days} дн."
             except Exception as exc:
                 log.warning("Audit errors use local fallback (%s)", type(exc).__name__)
@@ -346,6 +348,14 @@ class AuditMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as exc:
+            try:
+                if state:
+                    selected = await state.get_data()
+                    for key in ("site", "title", "voice", "provider", "quality", "delivery"):
+                        if key in selected:
+                            details[key] = selected[key]
+            except Exception:
+                log.warning("Audit error metadata unavailable")
             capture(exc, "handler_error", uid, **details)
             raise
         finally:

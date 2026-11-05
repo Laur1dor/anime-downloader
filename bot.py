@@ -64,7 +64,8 @@ async def main() -> None:
         audit = AuditStore(cfg.cache_db_path.with_name("audit.sqlite3"),
             dsn=cfg.audit_database_url, retention_days=cfg.audit_retention_days,
             max_events=cfg.audit_max_events, pg_max_events=cfg.audit_pg_max_events)
-        await audit.start((lambda text: bot.send_message(cfg.admin_id, text)) if cfg.audit_alerts else None)
+        await audit.start((lambda text: bot.send_message(cfg.admin_id, text)) if cfg.audit_alerts else None,
+                          owner_id=cfg.admin_id)
     except Exception as exc:
         log.error("Audit unavailable (%s); bot starts without statistics", type(exc).__name__)
 

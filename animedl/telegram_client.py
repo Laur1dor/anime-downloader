@@ -10,13 +10,27 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramServerError
+from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramServerError, TelegramBadRequest
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.methods import AnswerCallbackQuery
 from aiogram.types import FSInputFile, Message
 
 from .config import Config
 from .httpx_session import HttpxSession
 
 log = logging.getLogger(__name__)
+
+
+class CallbackAcknowledgementMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot, method):
+        try:
+            return await make_request(bot, method)
+        except TelegramBadRequest as exc:
+            from .error_messages import error_reason
+            if isinstance(method, AnswerCallbackQuery) and error_reason(exc) == "callback_expired":
+                log.info("Telegram: expired button acknowledgement ignored; handler continues")
+                return True
+            raise
 
 
 async def _send_with_flood_retry(factory: Callable[[], Awaitable[Message]],
@@ -51,6 +65,7 @@ def build_bot(cfg: Config) -> Bot:
         # Облачный api.telegram.org через httpx — обходит DPI-троттлинг, где aiohttp режется.
         session = HttpxSession()
         log.info("Использую облачный Bot API через httpx-транспорт.")
+    session.middleware(CallbackAcknowledgementMiddleware())
     return Bot(
         token=cfg.bot_token,
         session=session,

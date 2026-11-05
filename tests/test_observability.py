@@ -69,7 +69,7 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
         raw=self.store.db.execute('SELECT details FROM audit_events').fetchone()[0]
         self.assertNotIn('PRIVATE',raw)
         rows,_=await self.store.error_report()
-        self.assertEqual(tuple(rows[0][6:]),('TimeoutError','quality_menu'))
+        self.assertEqual(tuple(rows[0][6:8]),('TimeoutError','quality_menu'))
         message=SimpleNamespace(from_user=SimpleNamespace(id=1),answer=AsyncMock())
         await cmd_audit_errors(message,SimpleNamespace(admin_id=1),self.store)
         text=message.answer.call_args.args[0]
@@ -126,6 +126,40 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
         self.store.notifier.assert_awaited_once()
         self.assertNotIn("PRIVATE", self.store.notifier.call_args.args[0])
         self.assertEqual(self.store.errors()[0][3], 2)
+
+    async def test_alert_explains_other_users_failure_without_exception_text(self):
+        from aiogram.exceptions import TelegramForbiddenError
+        from aiogram.methods import SendVideo
+        self.store.notifier = AsyncMock()
+        self.store.owner_id = 1
+        self.store._last_alert_scan = 0
+        exc = TelegramForbiddenError(method=SendVideo(chat_id=2, video='unused'),
+            message='Forbidden: bot was blocked by the user https://private.invalid/SECRET')
+        self.store.record('telegram_error', 2, 'error', **audit.error_details(exc),
+                          title='<Anime>', episode=9, provider='Kodik')
+        await self.store._alerts()
+        text = self.store.notifier.call_args.args[0]
+        self.assertIn('Задача другого пользователя', text)
+        self.assertIn('Получатель заблокировал бота', text)
+        self.assertIn('серия 9', text)
+        self.assertIn('&lt;Anime&gt;', text)
+        self.assertNotIn('SECRET', text)
+        self.assertNotIn('TelegramForbiddenError', text)
+        rows, _ = await self.store.error_report()
+        self.assertEqual(tuple(rows[0][8:]), ('bot_blocked', 'telegram_error'))
+
+    async def test_errors_explain_legacy_rows_and_split_long_reports(self):
+        # Old stored rows lack a reason; do not invent a blocked/expired diagnosis.
+        rows = [('a'*16, 'TelegramBadRequest', 'base.py:check_response:121', 2, time.time(), None)] * 12
+        message = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
+        store = SimpleNamespace(error_report=AsyncMock(return_value=(rows, 'SQLite')))
+        await cmd_audit_errors(message, SimpleNamespace(admin_id=1), store)
+        replies = [call.args[0] for call in message.answer.call_args_list]
+        self.assertGreater(len(replies), 1)
+        self.assertTrue(all(len(text) < 4096 for text in replies))
+        self.assertEqual(sum(text.count('Группа:') for text in replies), 12)
+        self.assertTrue(all('Telegram отклонил запрос' in text for text in replies))
+        self.assertNotIn('заблокировал', '\n'.join(replies))
 
     async def test_owner_only_commands(self):
         message = SimpleNamespace(from_user=SimpleNamespace(id=2), answer=AsyncMock())

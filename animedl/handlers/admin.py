@@ -16,6 +16,7 @@ from ..cache.store import CacheStore
 from ..config import Config
 from ..models import MEDIA_CATEGORIES
 from ..observability import AuditStore, error_context
+from ..error_messages import error_explanation
 from ..keyboards import LIBRARY_BTN, RELOAD_BTN, SPEED_BTN
 
 log = logging.getLogger(__name__)
@@ -61,15 +62,28 @@ async def cmd_audit_errors(message: Message, cfg: Config, audit: AuditStore) -> 
     if not rows:
         await message.answer("В сохранённом журнале нет сгруппированных ошибок.")
         return
-    lines = ["⚠ Последние группы ошибок (UTC):", source]
+    lines = ["⚠ Последние ошибки (время UTC):", source,
+             "Это журнал отдельных сбоев. Итог каждой загрузки — в её сообщении о завершении."]
     for row in rows:
         fingerprint, cls, location, count, ts, http = row[:6]
         context = error_context(*row[6:8]) if len(row) >= 8 else ''
+        heading, impact, advice = error_explanation(dict(error_class=cls, http_status=http,
+            cause_class=row[6] if len(row) >= 8 else None,
+            reason=row[8] if len(row) >= 10 else None), row[9] if len(row) >= 10 else '')
         stamp = datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m %H:%M")
-        lines.append(f"{html.escape(cls or 'Error')}{' HTTP ' + str(http) if http else ''} ×{count} · {stamp}\n"
+        lines.append(f"{heading} · {count} событий · {stamp}\n{impact}\n{advice}\n"
+                     f"Диагностика: {html.escape(cls or 'Error')}{' HTTP ' + str(http) if http else ''}\n"
                      f"{html.escape(location or '')}"
                      f"{chr(10) + context if context else ''}\nГруппа: {fingerprint}")
-    await message.answer("\n\n".join(lines))
+    # Telegram limits message length; keep every group instead of truncating it.
+    chunk = ''
+    for line in lines:
+        if len(chunk) + len(line) + 2 > 3500:
+            await message.answer(chunk)
+            chunk = ''
+        chunk += ('\n\n' if chunk else '') + line
+    if chunk:
+        await message.answer(chunk)
 
 
 @router.message(Command("cache_stats"))
