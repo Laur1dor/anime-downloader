@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from .http import new_client
+from .observability import operation, confirmed, warning, error_details
 
 
 @dataclass(frozen=True)
@@ -109,27 +110,39 @@ async def search_sources(query: str, limit: int = 12) -> SearchResponse:
     errors: dict[str, str] = {}
     async with new_client(trust_env=False, timeout=6.0) as client:
         async def source(site: str, text: str) -> list[SearchHit]:
+            proof = operation('search_provider', site, text, scope='service', provider=site)
             try:
                 if site == "yummyanime":
                     response = await client.get("https://old.yummyani.me/api/search", params={"q": text, "limit": limit, "offset": 0})
                     response.raise_for_status()
-                    return parse_yummy_results(response.json(), limit)
+                    hits = parse_yummy_results(response.json(), limit)
+                    if hits:
+                        confirmed(proof, 'http_accepted')
+                    return hits
                 response = await client.get("https://animego.me/search/all", params={"q": text})
                 response.raise_for_status()
-                return parse_animego_results(response.text, limit)
+                hits = parse_animego_results(response.text, limit)
+                if hits:
+                    confirmed(proof, 'http_accepted')
+                return hits
             except Exception as exc:
+                warning('search_provider_warning', **(proof | error_details(exc)))
                 errors[site] = type(exc).__name__
                 return []
 
         async def catalogue() -> list[dict]:
+            proof = operation('search_provider', 'shikimori', query, scope='service', provider='shikimori')
             try:
                 response = await client.get("https://shikimori.io/api/animes", params={"search": query, "limit": 3})
                 response.raise_for_status()
                 rows = response.json()
                 if not isinstance(rows, list):
                     raise ValueError("Invalid Shikimori search response")
+                if any(isinstance(row, dict) and _positive_id(row.get('id')) for row in rows):
+                    confirmed(proof, 'http_accepted')
                 return [row for row in rows if isinstance(row, dict)]
             except Exception as exc:
+                warning('search_provider_warning', **(proof | error_details(exc)))
                 errors["shikimori"] = type(exc).__name__
                 return []
 

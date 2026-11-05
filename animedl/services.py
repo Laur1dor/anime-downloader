@@ -34,7 +34,7 @@ from .models import EpisodeRef, PlayerButton, TitleInfo, VideoVariant, make_cach
 from .players.registry import extract_variants
 from .sites.base import SiteParser
 from .telegram_client import extract_file_id, send_video_by_id, send_video_file
-from .observability import capture, emit
+from .observability import capture, emit, operation, bind_operation, confirmed, warning, needs_confirmation, error_details
 
 log = logging.getLogger(__name__)
 
@@ -149,11 +149,17 @@ async def qualities_for_buttons(buttons: list[PlayerButton], *, failures: list[s
     limit = asyncio.Semaphore(3)
 
     async def probe(button):
+        proof = operation('quality_probe', button.provider, button.voice, button.url,
+                          provider=button.provider, voice=button.voice)
         async with limit:
             try:
-                return await asyncio.wait_for(qualities_for_button(button), timeout=45)
+                with bind_operation(proof):
+                    result = await asyncio.wait_for(qualities_for_button(button), timeout=45)
+                if result:
+                    confirmed(proof, 'player_verified')
+                return result
             except Exception as exc:
-                capture(exc, "quality_probe_error", provider=button.provider)
+                capture(exc, "quality_probe_error", **proof)
                 log.info("Quality probe failed for %s (%s)", button.provider, type(exc).__name__)
                 if failures is not None and button.provider not in failures:
                     failures.append(button.provider)
@@ -184,6 +190,12 @@ async def process_episode(
     audit_started = time.monotonic()
     audit_job = uuid.uuid4().hex
     actual_quality = quality
+    canonical_url = title.url.split('#', 1)[0].split('?', 1)[0]
+    identity = (title.site, canonical_url, title.anime_id, episode.season, episode.number, voice, quality)
+    metadata = dict(title=title.title, site=title.site, episode=episode.number,
+                    season=episode.season, voice=voice, quality=quality)
+    source_proof = operation('source_download', *identity, **metadata)
+    delivery_proof = operation('telegram_delivery', chat_id, *identity, **metadata)
     def audit_result(result):
         emit("episode_finished", user_id, result.status, job_id=audit_job,
              title=title.title, site=title.site, episode=episode.number, season=episode.season,
@@ -201,6 +213,10 @@ async def process_episode(
     movie = is_movie(category)
     validate_delivery(cfg, user_id, delivery, category)
     wants_tg, wants_library = delivery != "library", delivery != "telegram"
+    library_proof = operation('library_publish',
+        str(cfg.category_dir(category)) if wants_library else '', category,
+        ' '.join((library_title or '').split()).casefold(), library_season,
+        ' '.join(library_season_name.split()).casefold(), *identity, **metadata)
     episode_season = episode.season if episode.season is not None else library_season
     episode_season_name = "" if episode.season is not None else library_season_name
     if wants_library:
@@ -235,8 +251,10 @@ async def process_episode(
             ids = json.loads(file_id[6:]) if file_id.startswith("parts:") else [file_id]
             for i, item in enumerate(ids, 1):
                 suffix = f" • часть {i}/{len(ids)}" if len(ids) > 1 else ""
-                await send_video_by_id(bot, chat_id, item, caption=caption + suffix)
+                with bind_operation(delivery_proof):
+                    await send_video_by_id(bot, chat_id, item, caption=caption + suffix)
             res.telegram = "cached"
+            confirmed(delivery_proof, 'all_parts_sent', user_id)
         except TelegramForbiddenError as e:
             res.telegram = "error"
             res.telegram_forbidden = True
@@ -245,6 +263,7 @@ async def process_episode(
             notes.append("Telegram запретил отправку в чат; дальнейшая загрузка остановлена")
         except Exception as e:
             res.telegram = "skipped"
+            capture(e, 'telegram_error', user_id, **delivery_proof)
             notes.append(f"Кэш Telegram недоступен, отправляю заново: {e}")
 
     def finish():
@@ -281,10 +300,14 @@ async def process_episode(
         try:
             recovered = None
             if recovery:
+                recovery_read = operation('recovery_cache_read', recovery_key, **metadata)
                 try:
-                    recovered = await asyncio.to_thread(recovery.load, recovery_key, Path(tmp) / "recovered.mp4")
+                    with bind_operation(recovery_read):
+                        recovered = await asyncio.to_thread(recovery.load, recovery_key, Path(tmp) / "recovered.mp4")
+                    confirmed(recovery_read, 'cache_verified', user_id)
                 except Exception as exc:
-                    log.warning("Recovery cache read failed (%s)", type(exc).__name__)
+                    warning('recovery_cache_warning', user_id, **(recovery_read | error_details(exc)))
+                    log.warning("Recovery cache read failed (%s)", type(exc).__name__, extra={'audit_recorded': True})
             if recovered:
                 result, provider, actual_quality = recovered
                 variant = VideoVariant(actual_quality, "")
@@ -352,12 +375,14 @@ async def process_episode(
 
                                 pump_task = asyncio.create_task(pump())
                                 try:
-                                    result = await download_variant(variant, attempt_dir / "video", progress, cancel_check=cancel_check)
+                                    with bind_operation(source_proof):
+                                        result = await download_variant(variant, attempt_dir / "video", progress, cancel_check=cancel_check)
                                     # CDN labels can lie (e.g. 720p points at the 480p file).
                                     # Width also accounts for cinematic letterboxing/cropped video.
                                     if max(result.height, result.width * 9 / 16) < variant.quality * 0.94:
                                         result = None
                                         raise ValueError(f"{button.provider}: файл ниже заявленного качества {variant.quality}p; отправка отменена")
+                                    confirmed(source_proof, 'download_validated', user_id)
                                 finally:
                                     pump_task.cancel()
                                     await asyncio.gather(pump_task, return_exceptions=True)
@@ -396,8 +421,7 @@ async def process_episode(
             res.note = "отменено на этой серии"
             return audit_result(res)
         except Exception as e:
-            capture(e, "source_error", user_id, job_id=audit_job, title=title.title,
-                    site=title.site, provider=provider, quality=quality, episode=episode.number)
+            capture(e, "source_error", user_id, **source_proof, job_id=audit_job, provider=provider)
             res.source_failed = True
             if wants_tg and res.telegram == "skipped":
                 res.telegram = "error"
@@ -422,12 +446,14 @@ async def process_episode(
                 if not category_ready(cfg, category):
                     raise OSError("Медиатека категории отключена")
                 archive_outcome = ArchiveOutcome()
-                archived_path = await asyncio.to_thread(archive_to_library, result.path, cfg.category_dir(category),
-                    library_title, episode.number, season=episode_season, season_name=episode_season_name, voice=voice, quality=variant.quality,
-                    provider=provider, identity=f"library-series|{library_title.casefold()}",
-                    source_identity=f"{title.site}|{cache_identity}", source_url=title.url,
-                    media_tag=category, outcome=archive_outcome, episode_title=display_title)
+                with bind_operation(library_proof):
+                    archived_path = await asyncio.to_thread(archive_to_library, result.path, cfg.category_dir(category),
+                        library_title, episode.number, season=episode_season, season_name=episode_season_name, voice=voice, quality=variant.quality,
+                        provider=provider, identity=f"library-series|{library_title.casefold()}",
+                        source_identity=f"{title.site}|{cache_identity}", source_url=title.url,
+                        media_tag=category, outcome=archive_outcome, episode_title=display_title)
                 res.library = "saved"
+                confirmed(library_proof, 'file_published', user_id)
                 if not archive_outcome.updated:
                     notes.append(f"Медиатека: оставлено имеющееся качество {archive_outcome.quality}p")
                 elif archive_outcome.upgraded:
@@ -435,22 +461,38 @@ async def process_episode(
             except Exception as e:
                 res.library = "error"
                 notes.append(f"Медиатека: {e}")
-                log.warning("Не удалось сохранить серию в медиатеку: %s", e)
-                capture(e, "library_error", user_id, job_id=audit_job, title=title.title, site=title.site)
-        if res.library == "saved" and archive_outcome.updated:
+                log.warning("Не удалось сохранить серию в медиатеку: %s", e, extra={'audit_recorded': True})
+                capture(e, "library_error", user_id, **library_proof, job_id=audit_job)
+        thumbnail_proof = operation('episode_thumbnail', archived_path, **metadata) if res.library == 'saved' else {}
+        poster_proof = operation('poster_fetch', title.poster, archived_path.parent, **metadata) if res.library == 'saved' else {}
+        if res.library == "saved" and (archive_outcome.updated or needs_confirmation(thumbnail_proof, user_id)
+                                        or needs_confirmation(poster_proof, user_id)):
             try:
-                if not await create_episode_thumbnail(archived_path, result.duration):
+                with bind_operation(thumbnail_proof):
+                    thumbnail_ok = await create_episode_thumbnail(archived_path, result.duration)
+                if thumbnail_ok:
+                    confirmed(thumbnail_proof, 'asset_verified', user_id)
+                else:
+                    warning('thumbnail_warning', user_id, **thumbnail_proof)
                     notes.append("Миниатюра эпизода недоступна; видео сохранено")
             except Exception:
+                warning('thumbnail_warning', user_id, **thumbnail_proof)
                 notes.append("Миниатюра эпизода недоступна; видео сохранено")
             if title.poster:
                 try:
-                    if not await download_poster(title.poster, archived_path.parent if movie else archived_path.parent.parent,
-                                                 referer=title.url, season_dir=None if movie else archived_path.parent):
+                    with bind_operation(poster_proof):
+                        poster_ok = await download_poster(title.poster, archived_path.parent if movie else archived_path.parent.parent,
+                                                         referer=title.url, season_dir=None if movie else archived_path.parent)
+                    if poster_ok:
+                        confirmed(poster_proof, 'asset_verified', user_id)
+                    else:
+                        warning('poster_warning', user_id, **poster_proof)
                         notes.append("Постер источника недоступен; видео сохранено")
                 except Exception:
+                    warning('poster_warning', user_id, **poster_proof)
                     notes.append("Постер источника недоступен; видео сохранено")
-        if res.library == "saved" and (archive_outcome.updated or archive_outcome.metadata_updated):
+        if res.library == "saved" and (archive_outcome.updated or archive_outcome.metadata_updated or
+                needs_confirmation(operation('jellyfin_refresh', cfg.jellyfin_url, scope='service'), user_id)):
             try:
                 if await refresh_library(cfg):
                     notes.append("Jellyfin: обновление библиотеки запрошено")
@@ -459,7 +501,7 @@ async def process_episode(
                 import httpx
                 reason = f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
                 notes.append(f"Jellyfin: обновление не удалось ({reason}); файл сохранён, обнови библиотеку вручную")
-                log.warning("Не удалось запросить обновление Jellyfin (%s)", reason)
+                log.warning("Не удалось запросить обновление Jellyfin (%s)", reason, extra={'audit_recorded': True})
         if wants_tg and res.telegram == "skipped":
             try:
                 result.meta.setdefault("upload_id", uuid.uuid4().hex)
@@ -477,12 +519,13 @@ async def process_episode(
                         continue
                     suffix = f" • часть {i}/{len(parts)}" if len(parts) > 1 else ""
                     await on_status(f"{tag}: отправка в Telegram{suffix}…")
-                    upload = asyncio.create_task(send_video_file(bot, chat_id, part.path,
-                        width=part.width, height=part.height, duration=part.duration, caption=caption + suffix,
-                        local_file_root=(getattr(cfg, "tg_local_file_root", None)
-                            if user_id is not None and user_id == cfg.admin_id
-                            and getattr(cfg, "tg_api_base_url", "")
-                            and getattr(cfg, "tg_api_local_mode", False) else None)))
+                    with bind_operation(delivery_proof):
+                        upload = asyncio.create_task(send_video_file(bot, chat_id, part.path,
+                            width=part.width, height=part.height, duration=part.duration, caption=caption + suffix,
+                            local_file_root=(getattr(cfg, "tg_local_file_root", None)
+                                if user_id is not None and user_id == cfg.admin_id
+                                and getattr(cfg, "tg_api_base_url", "")
+                                and getattr(cfg, "tg_api_local_mode", False) else None)))
                     try:
                         while not upload.done():
                             if cancel_check and cancel_check():
@@ -499,18 +542,21 @@ async def process_episode(
                         if isinstance(cache, CacheStore):
                             cache.put_part(session, i, file_id)
                 res.telegram = "sent"
+                confirmed(delivery_proof, 'all_parts_sent', user_id)
                 if len(file_ids) == len(parts):
                     stored = file_ids[0] if len(parts) == 1 else "parts:" + json.dumps(file_ids)
+                    cache_proof = operation('telegram_cache_write', key, scope='service', **metadata)
                     try:
                         cache.put(key, stored, title=caption, quality=variant.quality, size_bytes=result.size_bytes)
+                        confirmed(cache_proof, 'cache_verified', user_id)
                     except Exception as e:
+                        warning('telegram_cache_warning', user_id, **(cache_proof | error_details(e)))
                         notes.append("Видео отправлено, но кэш Telegram не сохранён")
-                        log.warning("Telegram cache write failed (%s)", type(e).__name__)
+                        log.warning("Telegram cache write failed (%s)", type(e).__name__, extra={'audit_recorded': True})
             except Exception as e:
                 res.telegram = "error"
                 res.telegram_forbidden = isinstance(e, TelegramForbiddenError)
-                capture(e, "telegram_error", user_id, job_id=audit_job, title=title.title,
-                        site=title.site, provider=provider, quality=quality, episode=episode.number)
+                capture(e, "telegram_error", user_id, **delivery_proof, job_id=audit_job, provider=provider)
                 notes.append("Telegram запретил отправку в чат; дальнейшая загрузка остановлена" if res.telegram_forbidden
                              else "Telegram: отправка отменена; уже принятые видео могут прийти позже" if isinstance(e, DownloadCancelled)
                              else "Telegram не подтвердил отправку; видео может прийти позже. Проверь чат перед повтором"
@@ -518,15 +564,21 @@ async def process_episode(
                              else f"Telegram: {e}" if isinstance(e, ValueError)
                              else f"Telegram: {type(e).__name__}: отправка не завершена")
         if recovery and not res.telegram_forbidden:
+            failed_delivery = (wants_tg and res.telegram == "error") or (wants_library and res.library == "error")
+            recovery_write = operation('recovery_cache_write' if failed_delivery else 'recovery_cache_discard', recovery_key, **metadata)
             try:
-                if (wants_tg and res.telegram == "error") or (wants_library and res.library == "error"):
+                if failed_delivery:
                     if recovered or await asyncio.to_thread(recovery.save, recovery_key, result, provider, variant.quality):
+                        if not recovered:
+                            confirmed(recovery_write, 'cache_verified', user_id)
                         notes.append(f"Видео сохранено для повтора до {cfg.retry_cache_hours} ч.; кэш ограничен, старые файлы вытесняются")
                     else:
                         notes.append("Не хватило места в ограниченном кэше; при повторе видео будет скачано заново")
                 else:
                     await asyncio.to_thread(recovery.discard, recovery_key)
+                    confirmed(recovery_write, 'cache_verified', user_id)
             except Exception as exc:
-                log.warning("Recovery cache unavailable (%s)", type(exc).__name__)
+                warning('recovery_cache_warning', user_id, **(recovery_write | error_details(exc)))
+                log.warning("Recovery cache unavailable (%s)", type(exc).__name__, extra={'audit_recorded': True})
                 notes.append("Сохранить видео для повтора не удалось")
         return finish()

@@ -47,10 +47,6 @@ async def main() -> None:
             await asyncio.to_thread(RecoveryStore(work / "recovery", cfg.retry_cache_bytes,
                 cfg.retry_cache_hours * 3600).prune)
 
-    if cfg.max_tg_mb <= 50 and not cfg.tg_api_base_url:
-        log.warning("Лимит отправки ~%d МБ (облачный Bot API). Для файлов до 2 ГБ "
-                    "подними локальный Bot API сервер (см. README).", cfg.max_tg_mb)
-
     from animedl.jobcontrol import configure_concurrency
     configure_concurrency(cfg.max_concurrent_jobs)
     log.info("Режим доступа: %s | одновременных задач: %d",
@@ -65,9 +61,15 @@ async def main() -> None:
             dsn=cfg.audit_database_url, retention_days=cfg.audit_retention_days,
             max_events=cfg.audit_max_events, pg_max_events=cfg.audit_pg_max_events)
         await audit.start((lambda text: bot.send_message(cfg.admin_id, text)) if cfg.audit_alerts else None,
-                          owner_id=cfg.admin_id)
+                          owner_id=cfg.admin_id,
+                          updater=(lambda mid, text: bot.edit_message_text(text, chat_id=cfg.admin_id, message_id=mid))
+                          if cfg.audit_alerts else None)
     except Exception as exc:
         log.error("Audit unavailable (%s); bot starts without statistics", type(exc).__name__)
+
+    if cfg.max_tg_mb <= 50 and not cfg.tg_api_base_url:
+        log.warning("Лимит отправки ~%d МБ (облачный Bot API). Для файлов до 2 ГБ "
+                    "подними локальный Bot API сервер (см. README).", cfg.max_tg_mb)
 
     dp = Dispatcher()
     dp["cfg"] = cfg

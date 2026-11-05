@@ -92,7 +92,7 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
         notifier = AsyncMock()
         await self.store.start(notifier)
         await __import__("asyncio").sleep(0.02)
-        self.assertEqual(self.store.stats()["pending"], 1)
+        self.assertEqual(self.store.stats()["pending"], 2)  # input + durable mirror incident
         self.assertTrue(self.store._db_failed)
 
     async def test_mirror_uses_stable_ids_and_marks_only_after_success(self):
@@ -226,6 +226,20 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
             self.store.db.commit()
             await self.store.flush()
             self.assertEqual((await self.store.report())["total"], 100)
+            # A mirror outage opens a durable incident; only a real successful
+            # PostgreSQL round trip may resolve it. All writes stay in this schema.
+            from unittest.mock import patch
+            with patch.object(self.store,'flush',AsyncMock(side_effect=ConnectionError('SECRET'))):
+                await self.store._tick()
+            self.assertTrue(self.store._db_failed)
+            self.store._next_flush=0
+            await self.store._tick()
+            mirror=[r for r in self.store.incidents.rows() if r['details'].get('operation')=='postgres_mirror'][0]
+            self.assertEqual(mirror['state'],'resolved')
+            await self.store.flush()
+            async with self.store.pool.acquire() as conn:
+                resolved=await conn.fetchval("SELECT COUNT(*) FROM audit_events WHERE details->>'incident_state'='resolved'")
+            self.assertGreaterEqual(resolved,1)
         finally:
             if self.store.pool:
                 await self.store.pool.close()

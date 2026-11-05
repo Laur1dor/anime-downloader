@@ -32,10 +32,33 @@ def error_explanation(details, action="") -> tuple[str, str, str]:
     reason = details.get("reason")
     cls = details.get("error_class") or ""
     cause = details.get("cause_class") or cls
+    op = details.get('operation')
+    if reason == 'warning_overflow':
+        return ('Очередь предупреждений переполнялась',
+                f"Часть предупреждений не поместилась в очередь. Счётчик потерь: {details.get('dropped_warnings', 0)}.",
+                'Проверь источник потока предупреждений. Потери учитываются в /stats; тишина не считается подтверждением исправления.')
+    optional = {
+        'episode_thumbnail': ('Не удалось подготовить миниатюру серии', 'Основное видео может быть сохранено; предупреждение относится к изображению.'),
+        'poster_fetch': ('Не удалось получить постер', 'Предупреждение относится к обложке, а не к доставке видео.'),
+        'jellyfin_refresh': ('Не подтверждено обновление библиотеки Jellyfin', 'Файл мог сохраниться; запрос сканирования библиотеки не подтверждён.'),
+        'voice_enumeration': ('Не удалось проверить серии одной озвучки', 'Список доступных серий этой озвучки может быть неполным.'),
+        'title_parse': ('Не удалось определить произведение и озвучки', 'Выбор загрузки не был подготовлен для этого источника.'),
+        'quality_menu': ('Не удалось подготовить выбор качества', 'Доступные качества для выбранных серий и озвучки не подтверждены.'),
+        'search_provider': ('Не удалось проверить один источник поиска', 'Другие источники и сохранённые результаты могут работать.'),
+        'postgres_mirror': ('PostgreSQL временно недоступен', 'События остаются в ограниченном локальном журнале; бот продолжает работать.'),
+        'telegram_polling': ('Прервалось получение сообщений из Telegram', 'Бот временно не мог получить новые команды. Это не доказывает сбой уже начатого скачивания.'),
+    }
+    if op in optional:
+        heading, impact = optional[op]
+        return heading, impact, 'Статус изменится после успешной проверки этой же операции. Подробности — /errors.'
     if reason == "callback_expired":
         return ("Telegram не принял подтверждение кнопки",
                 "Истёк срок ответа на нажатие. Сам по себе этот ответ не означает сбой скачивания.",
                 "Проверь текущее состояние задачи и итоговое сообщение бота.")
+    if details.get('severity') == 'warning' or reason == 'logged_warning' or (action == 'logging_warning' and reason != 'logged_error'):
+        return ('Предупреждение при работе бота',
+                'Код зарегистрировал предупреждение. Оно само по себе не означает провал загрузки.',
+                'Проверь итог задачи. Если для этой операции нет проверки восстановления, проблема останется открытой в /errors.')
     if reason in ("bot_blocked", "recipient_deactivated", "telegram_forbidden") or cls == "TelegramForbiddenError":
         why = {"bot_blocked": "Получатель заблокировал бота.",
                "recipient_deactivated": "Аккаунт получателя удалён или деактивирован."}.get(reason,
@@ -76,16 +99,31 @@ def error_explanation(details, action="") -> tuple[str, str, str]:
             "Проверь сообщение о завершении; для разбора используй код ошибки из /errors.")
 
 
+def event_context(details):
+    parts = [str(details[k])[:100] for k in ('title','provider','voice') if details.get(k)]
+    if details.get('season') is not None:
+        parts.append(f"сезон {details['season']}")
+    if details.get('episode') is not None:
+        parts.append(f"серия {details['episode']}")
+    return html.escape(' · '.join(parts))
+
+
 def format_error_alert(action, details, *, scope="") -> str:
     heading, impact, advice = error_explanation(details, action)
     lines = ["⚠ " + heading]
     if scope:
         lines.append(scope)
-    context = [str(details[k]) for k in ("title", "provider") if details.get(k)]
-    if details.get("episode") is not None:
-        context.append(f"серия {details['episode']}")
+    context = event_context(details)
     if context:
-        lines.append(html.escape(" · ".join(context)))
+        lines.append(context)
+    component = details.get('component', '')
+    for prefix, label in (('animedl.download','подготовка видео'),('animedl.artwork','изображения'),
+                          ('animedl.telegram_client','отправка Telegram'),('animedl.sites','разбор сайта'),
+                          ('animedl.handlers','обработка команды'),('aiogram','связь с Telegram'),
+                          ('animedl.admin_ops','служебное действие'),('animedl','обработка бота')):
+        if component.startswith(prefix):
+            lines.append('Компонент: ' + label)
+            break
     lines.extend(("", impact, advice))
     if details.get("stage"):
         from .observability import _STAGES

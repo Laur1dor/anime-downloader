@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from ..http import new_client
+from ..observability import operation, warning, confirmed, error_details
 from ..artwork import extract_poster_url
 from ..models import EpisodeRef, PlayerButton, TitleInfo, explicit_season, library_title_suggestion, anime_category_from_html, episode_name, source_mal_id
 from .base import ParseError, SiteParser
@@ -299,13 +300,17 @@ class YummyAnimeParser(SiteParser):
             sem = asyncio.Semaphore(8)
 
             async def load(v: _Voice, vu: str) -> None:
+                proof = operation('voice_enumeration', vu, scope='service', voice=v.title, provider='Kodik')
                 async with sem:
                     try:
                         rr = await client.get(vu)
                         v.episodes = _parse_episodes(rr.text)
                         v.episode_titles = _parse_episode_titles(rr.text)
+                        if v.episodes:
+                            confirmed(proof, 'player_verified')
                     except Exception as e:  # noqa: BLE001
-                        log.warning("YummyAnime: не загрузил озвучку %s: %s", v.title, e)
+                        warning('voice_enumeration_warning', **(proof | error_details(e)))
+                        log.warning("YummyAnime: не загрузил озвучку %s: %s", v.title, e, extra={'audit_recorded': True})
 
             await asyncio.gather(*(load(v, u) for v, u in zip(voices, urls)))
             voices.extend(self._api_voices.get(url, []))

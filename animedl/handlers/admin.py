@@ -37,7 +37,7 @@ async def cmd_audit_stats(message: Message, cfg: Config, audit: AuditStore) -> N
     stats = await audit.report()
     lines = [f"📊 Аудит за последние {audit.retention_days} дн.", stats["source"],
              f"Пользователей: {stats['users']} · действий/событий: {stats['total']}",
-             f"Ошибок: {stats['errors']}", "", "Обработка серий (включая повторы):"]
+             f"Ошибок: {stats['errors']} · предупреждений: {stats.get('warnings', 0)}", "", "Обработка серий (включая повторы):"]
     lines += [f"{html.escape(status)}: {count} · {size / 1024**3:.2f} ГБ" for status, count, size in stats["jobs"]]
     lines += ["", "Действия:"] + [f"{html.escape(action)}: {count}" for action, count in stats["actions"]]
     lines += ["", "Чаще загружают:"] + [f"{html.escape((title or 'Без названия')[:75])}: {count}" for title, count in stats["titles"]]
@@ -48,6 +48,11 @@ async def cmd_audit_stats(message: Message, cfg: Config, audit: AuditStore) -> N
     lines += ["", f"Хранилище: {stats['mirror']}"]
     if audit.dsn:
         lines.append(f"Ожидают записи в PostgreSQL: {stats['pending']} · вытеснено до записи: {stats['dropped']}")
+    if getattr(audit, 'incidents', None):
+        counts = audit.incidents.counts()
+        lines.append(f"Проблемы: {counts['open']} открыто, {counts['resolved']} решено; ожидают уведомления: {counts['pending']}")
+        lost = audit.db.execute("SELECT value FROM audit_meta WHERE key='warnings_dropped'").fetchone()
+        lines.append(f"Не поместилось в очередь предупреждений: {int(lost[0]) if lost else 0}")
     await message.answer("\n".join(lines))
 
 
@@ -59,11 +64,22 @@ async def cmd_audit_errors(message: Message, cfg: Config, audit: AuditStore) -> 
         await message.answer("Журнал аудита недоступен. Проверь диск и логи сервиса.")
         return
     rows, source = await audit.error_report()
-    if not rows:
+    incidents = getattr(audit, 'incidents', None)
+    current = incidents.rows() if incidents else []
+    if not rows and not current:
         await message.answer("В сохранённом журнале нет сгруппированных ошибок.")
         return
     lines = ["⚠ Последние ошибки (время UTC):", source,
              "Это журнал отдельных сбоев. Итог каждой загрузки — в её сообщении о завершении."]
+    if incidents:
+        counts = incidents.counts()
+        lines += [f"Проблемы с момента обновления: {counts['open']} открыто, {counts['resolved']} решено.\n"
+                  f"Очередь уведомлений: {counts['pending']}. Сбоев доставки уведомлений подряд: {counts['failures']}.\n"
+                  f"Вытеснено лимитом хранения: {counts['evicted']}."]
+        for row in current:
+            lines.append(incidents.format(row, cfg.admin_id))
+        if current:
+            lines.append('Ниже — история событий, включая уже пережитые сбои. Старые события без проверки восстановления автоматически не закрываются.')
     for row in rows:
         fingerprint, cls, location, count, ts, http = row[:6]
         context = error_context(*row[6:8]) if len(row) >= 8 else ''
@@ -84,6 +100,9 @@ async def cmd_audit_errors(message: Message, cfg: Config, audit: AuditStore) -> 
         chunk += ('\n\n' if chunk else '') + line
     if chunk:
         await message.answer(chunk)
+    if incidents:
+        # A confirmed owner reply allows a new bounded retry budget after delivery failures.
+        incidents.owner_reply_confirmed()
 
 
 @router.message(Command("cache_stats"))

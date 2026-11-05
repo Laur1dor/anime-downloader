@@ -13,6 +13,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramServerError, TelegramBadRequest
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.methods import AnswerCallbackQuery
+from aiogram.methods import SendMessage, SendVideo, SendDocument, SendAudio, GetUpdates
 from aiogram.types import FSInputFile, Message
 
 from .config import Config
@@ -31,6 +32,26 @@ class CallbackAcknowledgementMiddleware(BaseRequestMiddleware):
                 log.info("Telegram: expired button acknowledgement ignored; handler continues")
                 return True
             raise
+
+
+class TelegramAccessProofMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot, method):
+        from .observability import operation, confirmed, warning, error_details, needs_confirmation
+        chat_id = getattr(method, 'chat_id', None)
+        polling = isinstance(method, GetUpdates)
+        proof = operation('telegram_polling', scope='service') if polling else operation('telegram_access', chat_id)
+        try:
+            result = await make_request(bot, method)
+        except Exception as exc:
+            if polling:
+                warning('telegram_polling_warning', **(proof | error_details(exc)))
+            raise
+        if type(chat_id) is int and isinstance(method, (SendMessage, SendVideo, SendDocument, SendAudio)):
+            if needs_confirmation(proof, chat_id):
+                confirmed(proof, 'http_accepted', user_id=chat_id)
+        elif polling and needs_confirmation(proof):
+            confirmed(proof, 'http_accepted')
+        return result
 
 
 async def _send_with_flood_retry(factory: Callable[[], Awaitable[Message]],
@@ -66,6 +87,7 @@ def build_bot(cfg: Config) -> Bot:
         session = HttpxSession()
         log.info("Использую облачный Bot API через httpx-транспорт.")
     session.middleware(CallbackAcknowledgementMiddleware())
+    session.middleware(TelegramAccessProofMiddleware())
     return Bot(
         token=cfg.bot_token,
         session=session,

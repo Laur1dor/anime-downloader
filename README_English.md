@@ -52,7 +52,11 @@ Keep `.env`, keys, cookies and user databases private. Report errors with timest
 
 Owner-only `/stats` and `/errors` show the retained event history. Events include actions and download/delivery outcomes, sources, quality and sizes. Message contents, complete URLs, keys and exception text are excluded. User identifiers remain personal data: restrict database access and tell users about collection.
 
-The local SQLite journal defaults to 50,000 events and 30 days (`AUDIT_MAX_EVENTS`, `AUDIT_RETENTION_DAYS`). Commands query PostgreSQL when available and explicitly show local fallback otherwise; statistics cover retained history, not the bot's entire lifetime. Repeated identical error alerts go only to the owner, at most once per 30 minutes; `AUDIT_ALERTS=0` disables alerts.
+The local SQLite journal defaults to 50,000 events and 30 days (`AUDIT_MAX_EVENTS`, `AUDIT_RETENTION_DAYS`). Commands query PostgreSQL when available and explicitly show local fallback otherwise; statistics cover retained history, not the bot's entire lifetime. `AUDIT_ALERTS=0` disables outgoing alerts while retaining the journal.
+
+Warnings and errors from the `animedl` and `aiogram` loggers are collected without log text or arguments. `/errors` shows open and resolved incidents. Resolution requires a successful check of the same operation and resource; another episode's success or silence is insufficient. Unknown warnings without a reliable check stay open. Historical events from before this feature are not retroactively marked resolved.
+
+Incident state and pending notifications survive restarts. Recovery and recurrence edit the existing notification. The global notification limit is one API request per 30 seconds; repeated open-incident counters update at most every five minutes. Bursts of distinct incidents become a shared summary. The log queue holds 256 records and incident storage 500 entries; losses and evictions are reported. Short transients resolved before the first alert remain in history without a push. Three notification failures trigger a five-minute cooldown followed by one probe; Telegram `retry_after` is honoured. Uncertain network responses cannot guarantee exactly-once delivery, so retries and rate are bounded. Monitoring never edits production code.
 
 For optional PostgreSQL, set a long random alphanumeric `AUDIT_POSTGRES_PASSWORD` in `.env`, then run:
 

@@ -15,20 +15,29 @@ import sqlite3
 import time
 import traceback
 import uuid
+import queue
+import threading
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery
 from .error_messages import error_reason, format_error_alert
+from .incidents import Incidents
 
 log = logging.getLogger(__name__)
 _current = None
 _user = ContextVar("audit_user", default=None)
+_operation = ContextVar("audit_operation", default=None)
+_monitor_io = ContextVar("audit_monitor_io", default=False)
+_captured = ContextVar("audit_captured_exception", default=None)
 _FIELDS = {"site", "title", "provider", "voice", "quality", "delivery", "category",
            "episode", "season", "bytes", "telegram", "library", "state", "choice",
            "duration_ms", "error_class", "location", "fingerprint", "job_id", "source_failed", "http_status",
-           "cause_class", "cause_location", "stage", "reason"}
+           "cause_class", "cause_location", "stage", "reason", "operation", "operation_key",
+           "attempt_id", "attempt_started", "proof", "scope", "severity", "component",
+           "incident_id", "incident_state", "dropped_warnings"}
 _STAGES = {'navigation': 'открытие плеера', 'manifest': 'ожидание HLS',
            'selection': 'проверка серии и озвучки', 'quality_menu': 'меню качества',
            'quality_switch': 'переключение качества', 'media_download': 'загрузка видео',
@@ -104,12 +113,80 @@ def error_details(exc):
 
 
 def emit(action, user_id=None, status="ok", **details):
-    if _current is not None:
-        _current.record(action, user_id if user_id is not None else _user.get(), status, **details)
+    if _current is not None and not _monitor_io.get():
+        _current.record(action, user_id if user_id is not None else _user.get(), status,
+                        **((_operation.get() or {}) | details))
 
 
 def capture(exc, action="error", user_id=None, **details):
+    from aiogram.exceptions import TelegramForbiddenError
+    if isinstance(exc, TelegramForbiddenError) and type(getattr(exc.method, 'chat_id', None)) is int:
+        user_id = exc.method.chat_id
+        details |= operation('telegram_access', user_id)
+    _captured.set((id(exc), time.monotonic()))
     emit(action, user_id, "error", **(details | error_details(exc)))
+
+
+def operation(name, *identity, **details):
+    raw = json.dumps([name, *identity], ensure_ascii=False, default=str, separators=(',', ':'))
+    return details | dict(operation=name, operation_key=hashlib.sha256(raw.encode()).hexdigest(),
+                          attempt_id=uuid.uuid4().hex, attempt_started=time.time())
+
+
+@contextmanager
+def bind_operation(details):
+    token = _operation.set(details)
+    try:
+        yield
+    finally:
+        _operation.reset(token)
+
+
+def confirmed(details, proof, user_id=None):
+    emit('operation_succeeded', user_id, proof=proof, **details)
+
+
+def needs_confirmation(details, user_id=None):
+    if _current is None:
+        return False
+    try:
+        return _current.incidents.is_open(user_id if user_id is not None else _user.get(), details)
+    except sqlite3.Error:
+        return False
+
+
+def warning(action, user_id=None, **details):
+    details.setdefault('error_class', 'Warning')
+    details.setdefault('fingerprint', hashlib.sha256(action.encode()).hexdigest()[:16])
+    emit(action, user_id, 'warning', **details)
+
+
+class WarningCollector(logging.Handler):
+    """Never format log text/args; worker threads enqueue only safe metadata."""
+    def __init__(self, store):
+        super().__init__(logging.WARNING)
+        self.store = store
+
+    def emit(self, record):
+        if _monitor_io.get() or getattr(record, 'audit_recorded', False) or record.name.startswith(('animedl.observability', 'animedl.incidents')):
+            return  # Monitoring its own delivery failures would recurse forever.
+        captured = _captured.get()
+        if record.exc_info and captured and captured[0] == id(record.exc_info[1]) and time.monotonic() - captured[1] < 5:
+            return
+        location = f'{Path(record.pathname).name}:{record.funcName}:{record.lineno}'
+        cls = type(record.exc_info[1]).__name__ if record.exc_info else 'LogWarning'
+        signature = f'{record.name}:{Path(record.pathname).name}:{record.funcName}:{record.levelno}:{cls}'
+        details = (_operation.get() or {}) | dict(error_class=cls, location=location,
+            component=record.name, reason='logged_error' if record.levelno >= logging.ERROR else 'logged_warning',
+            fingerprint=hashlib.sha256(signature.encode()).hexdigest()[:16])
+        if record.name.startswith('aiogram') and record.funcName == '_listen_updates':
+            details |= operation('telegram_polling', scope='service')
+        try:
+            self.store.log_queue.put_nowait((record.created, _user.get(),
+                'error' if record.levelno >= logging.ERROR else 'warning', safe_details(details)))
+        except queue.Full:
+            with self.store.log_overflow_lock:
+                self.store.log_overflow += 1
 
 
 class AuditStore:
@@ -139,18 +216,40 @@ class AuditStore:
         self._last_alert_scan = time.time()
         self._db_failed = False
         self._local_failed = False
+        self.incidents = Incidents(self.db)
+        self.log_queue = queue.Queue(maxsize=256)
+        self.log_overflow = 0
+        self.log_overflow_lock = threading.Lock()
+        self.log_handler = None
+        self.updater = None
+        self._draining_logs = False
+        self._next_flush = 0
 
-    def record(self, action, user_id=None, status="ok", **details):
+    def record(self, action, user_id=None, status="ok", *, _event_time=None, **details):
         try:
+            if action == 'operation_succeeded' and not self._draining_logs:
+                self._drain_logs()
+            now = time.time() if _event_time is None else _event_time
+            details = safe_details(details)
+            if status in ('error', 'warning') and action not in ('episode_finished', 'action_finished'):
+                details.setdefault('fingerprint', hashlib.sha256(action.encode()).hexdigest()[:16])
+                details['severity'] = status
+                identity, state = self.incidents.failure(user_id, action, details, now)
+                details |= dict(incident_id=identity, incident_state=state)
+            elif action == 'operation_succeeded':
+                identity = self.incidents.success(user_id, details, now)
+                if identity:
+                    details |= dict(incident_id=identity, incident_state='resolved')
             self.db.execute("INSERT INTO audit_events VALUES (?,?,?,?,?,?,0)",
-                (uuid.uuid4().hex, time.time(), user_id, action[:60], status[:30],
-                 json.dumps(safe_details(details), ensure_ascii=False)))
+                (uuid.uuid4().hex, now, user_id, action[:60], status[:30],
+                 json.dumps(details, ensure_ascii=False)))
             self.db.commit()
             self._count += 1
             # Hard event limit even if PostgreSQL is unavailable for months.
             if self._count > self.max_events or time.time() - self._last_prune > 60:
                 self.prune()
             self._local_failed = False
+            return True
         except (sqlite3.Error, OSError):
             try:
                 self.db.rollback()
@@ -159,6 +258,37 @@ class AuditStore:
             if not self._local_failed:
                 log.error("Audit journal unavailable; download processing continues")
                 self._local_failed = True
+            return False
+
+    def _drain_logs(self):
+        self._draining_logs = True
+        lost = 0
+        try:
+            for _ in range(256):
+                try:
+                    ts, uid, status, details = self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not self.record('logging_warning', uid, status, _event_time=ts, **details):
+                    lost += 1
+            with self.log_overflow_lock:
+                lost += self.log_overflow
+                self.log_overflow = 0
+            if lost:
+                self.db.execute("INSERT INTO audit_meta VALUES('warnings_dropped',?) ON CONFLICT(key) "
+                                'DO UPDATE SET value=value+excluded.value', (lost,))
+                self.db.commit()
+                total = self.db.execute("SELECT value FROM audit_meta WHERE key='warnings_dropped'").fetchone()[0]
+                details = operation('warning_collection', scope='service', reason='warning_overflow',
+                                    dropped_warnings=int(total), error_class='Warning')
+                details['fingerprint'] = hashlib.sha256(b'warning_collection_overflow').hexdigest()[:16]
+                self.record('warning_collection_overflow', None, 'warning', **details)
+        except (sqlite3.Error, OSError):
+            with self.log_overflow_lock:
+                self.log_overflow += lost
+            log.error('Warning journal unavailable; bot continues')
+        finally:
+            self._draining_logs = False
 
     def prune(self):
         cutoff = time.time() - self.retention_days * 86400
@@ -171,26 +301,36 @@ class AuditStore:
         if dropped and self.dsn:
             self.db.execute("INSERT INTO audit_meta VALUES ('dropped',?) ON CONFLICT(key) DO UPDATE SET value=value+excluded.value", (dropped,))
         self.db.execute("DELETE FROM audit_alerts WHERE ts < ?", (cutoff,))
+        self.incidents.prune(cutoff)
         self.db.commit()
         self._count = self.db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         self._last_prune = time.time()
 
-    async def start(self, notifier=None, *, owner_id=None):
+    async def start(self, notifier=None, *, owner_id=None, updater=None):
         global _current
         _current = self
         self.notifier = notifier
         self.owner_id = owner_id
+        self.updater = updater
+        self.log_handler = WarningCollector(self)
+        for name in ('animedl', 'aiogram'):
+            logging.getLogger(name).addHandler(self.log_handler)
         self.task = asyncio.create_task(self._worker(), name="audit-mirror")
 
     async def close(self):
         global _current
         if _current is self:
             _current = None
+        if self.log_handler:
+            for name in ('animedl', 'aiogram'):
+                logging.getLogger(name).removeHandler(self.log_handler)
+            self.log_handler.close()
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
         if self.pool:
             await asyncio.wait_for(self.pool.close(), timeout=5)
+        self._drain_logs()
         self.db.close()
 
     async def flush(self):
@@ -216,50 +356,43 @@ class AuditStore:
                 self._last_pg_prune = time.time()
 
     async def _alerts(self):
-        now = time.time()
-        rows = self.db.execute("SELECT ts,action,details,user_id FROM audit_events WHERE status='error' AND ts>? ORDER BY ts LIMIT 100",
-                               (self._last_alert_scan,)).fetchall()
-        self._last_alert_scan = now
-        if not self.notifier:
-            return
-        for ts, action, raw, uid in rows:
-            details = json.loads(raw)
-            fingerprint = details.get("fingerprint")
-            if not fingerprint:
-                continue
-            recent = self.db.execute("SELECT ts FROM audit_alerts WHERE fingerprint=?", (fingerprint,)).fetchone()
-            if recent and now - recent[0] < 1800:
-                continue
-            self.db.execute("INSERT OR REPLACE INTO audit_alerts VALUES (?,?)", (fingerprint, now))
-            self.db.commit()
-            owner_id = getattr(self, 'owner_id', None)
-            scope = ('Твоя задача.' if uid == owner_id else 'Задача другого пользователя.') if uid is not None and owner_id is not None else ''
-            text = format_error_alert(action, details, scope=scope)
+        self._drain_logs()
+        token = _monitor_io.set(True)
+        try:
+            await self.incidents.notify(self.notifier, self.updater,
+                                        owner=getattr(self, 'owner_id', None))
+        finally:
+            _monitor_io.reset(token)
+
+    async def _tick(self):
+        self.prune()
+        await self._alerts()
+        if self.dsn and time.time() >= self._next_flush:
+            proof = operation('postgres_mirror', scope='service')
             try:
-                await asyncio.wait_for(self.notifier(text), timeout=5)
-            except Exception:
-                log.warning("Audit alert could not be delivered")
+                await self.flush()
+            except Exception as exc:
+                self.record('audit_mirror_error', None, 'error', **(proof | error_details(exc)))
+                if not self._db_failed:
+                    log.warning('Audit mirror unavailable (%s); events stay in bounded journal', type(exc).__name__)
+                self._db_failed = True
+                self._next_flush = time.time() + 30
+            else:
+                if self.incidents.is_open(None, proof):
+                    self.record('operation_succeeded', None, **proof, proof='database_roundtrip')
+                self._db_failed = False
 
     async def _worker(self):
         while True:
-            delay = 5
             try:
-                self.prune()
-                await self._alerts()
-                await self.flush()
-                if self._db_failed:
-                    log.info("Audit PostgreSQL connection restored")
-                self._db_failed = False
+                await self._tick()
             except Exception as exc:
-                if not self._db_failed:
-                    log.warning("Audit mirror unavailable (%s); events stay in bounded journal", type(exc).__name__)
-                self._db_failed = True
-                delay = 30
-            await asyncio.sleep(delay)
+                log.error('Monitoring iteration failed (%s); bot continues', type(exc).__name__)
+            await asyncio.sleep(5)
 
     def stats(self):
         since = time.time() - self.retention_days * 86400
-        total, users, errors = self.db.execute("SELECT COUNT(*),COUNT(DISTINCT user_id),SUM(status='error') FROM audit_events WHERE ts>=?", (since,)).fetchone()
+        total, users, errors, warnings = self.db.execute("SELECT COUNT(*),COUNT(DISTINCT user_id),SUM(status='error'),SUM(status='warning') FROM audit_events WHERE ts>=?", (since,)).fetchone()
         actions = self.db.execute("SELECT action,COUNT(*) FROM audit_events WHERE ts>=? GROUP BY action ORDER BY COUNT(*) DESC LIMIT 12", (since,)).fetchall()
         jobs = self.db.execute("SELECT status,COUNT(*),COALESCE(SUM(CAST(json_extract(details,'$.bytes') AS INTEGER)),0) FROM audit_events WHERE action='episode_finished' AND ts>=? GROUP BY status", (since,)).fetchall()
         titles = self.db.execute("SELECT json_extract(details,'$.title'),COUNT(*) FROM audit_events WHERE action='episode_started' AND ts>=? GROUP BY json_extract(details,'$.title') ORDER BY COUNT(*) DESC LIMIT 8", (since,)).fetchall()
@@ -268,7 +401,7 @@ class AuditStore:
         providers = self.db.execute("SELECT COALESCE(json_extract(details,'$.provider'),'—'),json_extract(details,'$.quality'),status,COUNT(*) FROM audit_events WHERE action='episode_finished' AND ts>=? GROUP BY 1,2,3 ORDER BY COUNT(*) DESC LIMIT 12", (since,)).fetchall()
         top_users = self.db.execute("SELECT user_id,COUNT(*),SUM(status IN ('error','partial')) FROM audit_events WHERE action='episode_finished' AND ts>=? GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 8", (since,)).fetchall()
         failures = self.db.execute("SELECT json_extract(details,'$.error_class'),json_extract(details,'$.http_status'),COUNT(*) FROM audit_events WHERE status='error' AND ts>=? AND json_extract(details,'$.error_class') IS NOT NULL GROUP BY 1,2 ORDER BY COUNT(*) DESC LIMIT 8", (since,)).fetchall()
-        return dict(total=total, users=users, errors=errors or 0, actions=actions, jobs=jobs,
+        return dict(total=total, users=users, errors=errors or 0, warnings=warnings or 0, actions=actions, jobs=jobs,
                     titles=titles, pending=pending, dropped=int(dropped[0]) if dropped else 0,
                     providers=providers, top_users=top_users, failures=failures,
                     source=f"SQLite, до {self.max_events} последних событий",
@@ -279,7 +412,7 @@ class AuditStore:
             json_extract(details,'$.error_class'),json_extract(details,'$.location'),
             COUNT(*),MAX(ts),json_extract(details,'$.http_status'),
             json_extract(details,'$.cause_class'),json_extract(details,'$.stage'),
-            json_extract(details,'$.reason'),action FROM audit_events WHERE status='error'
+            json_extract(details,'$.reason'),action FROM audit_events WHERE status IN ('error','warning')
             AND json_extract(details,'$.fingerprint') IS NOT NULL
             GROUP BY json_extract(details,'$.fingerprint'),action ORDER BY MAX(ts) DESC LIMIT 12""").fetchall()
         return rows
@@ -292,14 +425,14 @@ class AuditStore:
         since = time.time() - self.retention_days * 86400
         try:
             async with self.pool.acquire() as conn:
-                totals = await conn.fetchrow("SELECT COUNT(*),COUNT(DISTINCT user_id),COUNT(*) FILTER(WHERE status='error') FROM audit_events WHERE ts>=$1", since)
+                totals = await conn.fetchrow("SELECT COUNT(*),COUNT(DISTINCT user_id),COUNT(*) FILTER(WHERE status='error'),COUNT(*) FILTER(WHERE status='warning') FROM audit_events WHERE ts>=$1", since)
                 actions = await conn.fetch("SELECT action,COUNT(*) FROM audit_events WHERE ts>=$1 GROUP BY action ORDER BY COUNT(*) DESC LIMIT 12", since)
                 jobs = await conn.fetch("SELECT status,COUNT(*),COALESCE(SUM(COALESCE((details->>'bytes')::bigint,0)),0) FROM audit_events WHERE action='episode_finished' AND ts>=$1 GROUP BY status", since)
                 titles = await conn.fetch("SELECT details->>'title',COUNT(*) FROM audit_events WHERE action='episode_started' AND ts>=$1 GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 8", since)
                 providers = await conn.fetch("SELECT COALESCE(details->>'provider','—'),details->>'quality',status,COUNT(*) FROM audit_events WHERE action='episode_finished' AND ts>=$1 GROUP BY 1,2,3 ORDER BY COUNT(*) DESC LIMIT 12", since)
                 users = await conn.fetch("SELECT user_id,COUNT(*),COUNT(*) FILTER(WHERE status IN ('error','partial')) FROM audit_events WHERE action='episode_finished' AND ts>=$1 GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 8", since)
                 failures = await conn.fetch("SELECT details->>'error_class',details->>'http_status',COUNT(*) FROM audit_events WHERE status='error' AND ts>=$1 AND details->>'error_class' IS NOT NULL GROUP BY 1,2 ORDER BY COUNT(*) DESC LIMIT 8", since)
-            local.update(total=totals[0], users=totals[1], errors=totals[2], actions=actions,
+            local.update(total=totals[0], users=totals[1], errors=totals[2], warnings=totals[3], actions=actions,
                          jobs=jobs, titles=titles, providers=providers, top_users=users, failures=failures,
                          source=f"PostgreSQL, до {self.pg_max_events} последних событий")
             return local
@@ -314,7 +447,7 @@ class AuditStore:
                     rows = await conn.fetch("""SELECT details->>'fingerprint',details->>'error_class',
                         details->>'location',COUNT(*),MAX(ts),details->>'http_status',
                         details->>'cause_class',details->>'stage',details->>'reason',action
-                        FROM audit_events WHERE status='error' AND details->>'fingerprint' IS NOT NULL
+                        FROM audit_events WHERE status IN ('error','warning') AND details->>'fingerprint' IS NOT NULL
                         GROUP BY 1,2,3,6,7,8,9,10 ORDER BY MAX(ts) DESC LIMIT 12""")
                 return rows, f"PostgreSQL, до {self.pg_max_events} событий / {self.retention_days} дн."
             except Exception as exc:

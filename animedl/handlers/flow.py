@@ -12,7 +12,7 @@ from ..cache.store import CacheStore
 from ..catalog import CatalogStore
 from ..admin_ops import category_ready
 from ..config import Config
-from ..observability import capture, emit
+from ..observability import capture, emit, operation, confirmed, warning
 from ..fsm.states import DownloadFlow
 from ..jobcontrol import (end_job, get_job, global_semaphore, is_busy, start_job)
 from ..keyboards import (category_kb, confirm_kb, delivery_kb, library_details_kb, episodes_kb, job_kb, providers_kb, quality_kb,
@@ -98,6 +98,7 @@ async def open_title(message: Message, state: FSMContext, url: str,
     else:
         await status.edit_text("🔎 Определяю тайтл и озвучки…", reply_markup=None)
     search_data = await state.get_data()
+    title_proof = operation('title_parse', url.split('#', 1)[0].split('?', 1)[0])
     try:
         title = await parser.fetch_title(url)
         if catalog is not None:
@@ -116,25 +117,28 @@ async def open_title(message: Message, state: FSMContext, url: str,
             import html
             await status.edit_text(f"🎬 <b>{html.escape(title.title)}</b>\nВыбери сезон или весь сериал:",
                                    reply_markup=search_back_kb(seasons_kb(seasons, title.season), search_data))
+            confirmed(title_proof, 'player_verified')
             return
         ref_ep = title.episodes[0]
         buttons = await parser.fetch_episode_players(title, ref_ep)
     except (ParseError, UnsupportedSite) as e:
-        capture(e, "title_parse_error")
+        capture(e, "title_parse_error", **title_proof)
         await status.edit_text(f"⚠ {e}")
         return
     except Exception as e:  # noqa: BLE001
-        capture(e, "title_parse_error")
+        capture(e, "title_parse_error", **title_proof)
         log.exception("Ошибка разбора тайтла")
         await status.edit_text(f"⚠ Не удалось разобрать страницу: {e}")
         return
 
     if not buttons:
+        warning('title_players_warning', **title_proof)
         await status.edit_text("⚠ Для этого тайтла пока нет доступных плееров "
                                "(возможно, серия ещё не вышла).")
         return
 
     voices = group_voices(buttons)
+    confirmed(title_proof, 'player_verified')
     await state.set_state(DownloadFlow.choosing_voice)
     await state.update_data(
         url=url, site=title.site, anime_id=title.anime_id, title=title.title, season=title.season, poster=title.poster,
@@ -330,41 +334,58 @@ async def _quality_menu(state: FSMContext, qs: list[int]):
     return text, kb
 
 
+async def _quality_proof(state):
+    data = await state.get_data()
+    selected = data.get('ep_numbers') or [1]
+    episodes = data.get('episodes') or []
+    index = selected[0] - 1
+    episode = episodes[index] if 0 <= index < len(episodes) else {}
+    return operation('quality_menu', data.get('url'), data.get('voice'),
+                     episode.get('season'), episode.get('number'), episode.get('db_id'),
+                     title=data.get('title'), voice=data.get('voice'))
+
+
 async def _ask_quality(cq: CallbackQuery, state: FSMContext) -> None:
+    proof = await _quality_proof(state)
     await cq.message.edit_text("⏳ Получаю доступные качества…")
     try:
         qs = await _resolve_quality_options(state)
     except (ExtractError, ParseError) as e:
-        capture(e, "quality_resolve_error")
+        capture(e, "quality_resolve_error", **proof)
         await cq.message.edit_text(f"⚠ Не удалось получить видео с этого плеера: {e}\n"
                                    "Попробуй позже или выбери другую озвучку: пришли ссылку заново.")
         await state.clear()
         return
     if not qs:
+        warning('quality_menu_warning', **proof)
         await cq.message.edit_text("⚠ Не удалось определить качества. Пришли ссылку заново.")
         await state.clear()
         return
     await state.update_data(qualities=qs)
+    confirmed(proof, 'player_verified')
     await state.set_state(DownloadFlow.choosing_quality)
     text, kb = await _quality_menu(state, qs)
     await cq.message.edit_text(text, reply_markup=kb)
 
 
 async def _ask_quality_msg(message: Message, state: FSMContext) -> None:
+    proof = await _quality_proof(state)
     status = await _flow_reply(message, state, "⏳ Получаю доступные качества…")
     try:
         qs = await _resolve_quality_options(state)
     except (ExtractError, ParseError) as e:
-        capture(e, "quality_resolve_error")
+        capture(e, "quality_resolve_error", **proof)
         await status.edit_text(f"⚠ Не удалось получить видео с этого плеера: {e}\n"
                                "Попробуй позже или выбери другую озвучку.")
         await state.clear()
         return
     if not qs:
+        warning('quality_menu_warning', **proof)
         await status.edit_text("⚠ Не удалось определить качества. Пришли ссылку заново.")
         await state.clear()
         return
     await state.update_data(qualities=qs)
+    confirmed(proof, 'player_verified')
     await state.set_state(DownloadFlow.choosing_quality)
     text, kb = await _quality_menu(state, qs)
     await status.edit_text(text, reply_markup=kb)

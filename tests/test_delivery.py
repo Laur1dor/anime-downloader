@@ -18,6 +18,72 @@ from animedl.handlers.flow import (on_category, on_delivery, on_quality, on_go, 
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def auditing(self):
+        from contextlib import contextmanager
+        from animedl import observability as audit
+        @contextmanager
+        def enabled():
+            store=audit.AuditStore(self.root/'audit.db')
+            previous=audit._current
+            audit._current=store
+            token=audit._user.set(1)
+            try:
+                yield store
+            finally:
+                audit._user.reset(token)
+                audit._current=previous
+                store.db.close()
+        return enabled()
+
+    async def test_source_incident_closes_only_after_same_episode_download_is_validated(self):
+        with self.auditing() as store:
+            self.parser.fetch_episode_players.side_effect=ValueError('unavailable')
+            await self.run_episode()
+            source=[r for r in store.incidents.rows() if r['details'].get('operation')=='source_download'][0]
+            self.assertEqual(source['state'],'open')
+            self.parser.fetch_episode_players.side_effect=None
+            await self.run_episode(episode=EpisodeRef(2,'ep2'))
+            self.assertEqual(store.incidents.rows()[0]['state'],'open')
+            await self.run_episode()
+            source=[r for r in store.incidents.rows() if r['details'].get('operation')=='source_download'][0]
+            self.assertEqual(source['state'],'resolved')
+
+    async def test_other_episode_delivery_does_not_close_failed_send(self):
+        with self.auditing() as store:
+            self.upload.side_effect=RuntimeError('not accepted')
+            await self.run_episode()
+            self.upload.side_effect=None
+            await self.run_episode(episode=EpisodeRef(2,'ep2'))
+            self.assertEqual(store.incidents.counts()['open'],1,store.incidents.rows())
+            await self.run_episode()
+            self.assertEqual(store.incidents.counts()['open'],0)
+            self.assertEqual(store.incidents.rows()[0]['details']['proof'],'all_parts_sent')
+
+    async def test_published_video_does_not_close_missing_thumbnail_and_equal_quality_retry_repairs_it(self):
+        with self.auditing() as store:
+            self.thumbnail.side_effect=[False,True]
+            result=await self.run_episode('library')
+            self.assertEqual(result.library,'saved')
+            self.assertEqual(store.incidents.counts()['open'],1)
+            await self.run_episode('library')
+            self.assertEqual(self.thumbnail.await_count,2)
+            self.assertEqual(store.incidents.rows()[0]['state'],'resolved')
+            self.assertEqual(store.incidents.rows()[0]['details']['proof'],'asset_verified')
+
+    async def test_other_library_destination_does_not_close_failed_archive(self):
+        with self.auditing() as store:
+            self.archive.side_effect=OSError('unavailable')
+            await self.run_episode('library')
+            self.archive.side_effect=None
+            old=self.cfg.library_dir
+            other=self.root/'other-library';other.mkdir();(other/'.animedl-library').touch()
+            self.cfg.library_dir=other
+            await self.run_episode('library')
+            self.assertEqual(store.incidents.counts()['open'],1)
+            self.cfg.library_dir=old
+            await self.run_episode('library')
+            self.assertEqual(store.incidents.counts()['open'],0)
+
     async def test_forbidden_cached_send_never_falls_back_to_download(self):
         from aiogram.exceptions import TelegramForbiddenError
         from aiogram.methods import SendVideo

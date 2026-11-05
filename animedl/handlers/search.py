@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from ..catalog import CatalogStore
 from ..config import Config
-from ..observability import capture, emit
+from ..observability import capture, emit, operation, confirmed
 from ..jobcontrol import get_job
 from ..search_sources import search_sources
 from .flow import open_title
@@ -97,15 +97,17 @@ async def on_search(message: Message, state: FSMContext, catalog: CatalogStore) 
         cached = catalog.search(query, limit=20)
         errors = {}
         hits = []
+        request_proof = operation('search_request', query)
         try:
             response = await asyncio.wait_for(search_sources(query, limit=20), timeout=25)
             hits, errors = response.hits, response.errors
+            if hits:
+                confirmed(request_proof, 'http_accepted', uid)
         except Exception as exc:
-            capture(exc, "search_error", uid)
-            log.warning("Search failed: %s", type(exc).__name__)
+            capture(exc, "search_error", uid, **request_proof)
+            log.warning("Search failed: %s", type(exc).__name__, extra={'audit_recorded': True})
             errors = {"поиск": type(exc).__name__}
         for provider in errors:
-            emit("search_provider_error", uid, "error", provider=provider)
             catalog.event(uid, "provider_error", site=provider)
         hits = [catalog.remember(hit) for hit in hits]
         # Keep distinct seasons/sources; their names alone are never an identity.
