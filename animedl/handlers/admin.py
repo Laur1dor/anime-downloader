@@ -1,6 +1,7 @@
 """Служебные команды: статистика и очистка кэша."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import html
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from ..admin_ops import (delete_media_title, list_media_library, category_ready,
+from ..admin_ops import (delete_media_title, list_media_library, category_ready, library_overview,
                          read_bandwidth, restart_containers,
                          write_bandwidth)
 from ..cache.store import CacheStore
@@ -177,13 +178,8 @@ async def toggle_library(message: Message, cfg: Config) -> None:
     if not cfg.library_dir and not cfg.media_root:
         await message.answer("⚠ Медиатека не настроена (LIBRARY_DIR в .env не задан).")
         return
-    connected = category_ready(cfg, "anime")
-    categories = "\n".join(f"{'✅' if category_ready(cfg, key) else '⚠'} {label}"
-                             for key, (label, _) in MEDIA_CATEGORIES.items())
-    await message.answer(
-        "📁 Медиатека: " + ("папка подключена." if connected else "папка недоступна, проверь подключение и маркер .animedl-library.")
-        + "\nДоставка выбирается для каждой загрузки после качества: Telegram, медиатека или оба. "
-        "В медиатеку может сохранять только владелец бота.\n" + categories)
+    overview = await asyncio.to_thread(library_overview, cfg)
+    await message.answer(overview + "\n\nДоставка выбирается для каждой загрузки: Telegram, медиатека или оба. Сохранение в медиатеку доступно только владельцу.")
 
 
 

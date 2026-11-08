@@ -362,3 +362,48 @@ def archive_to_library(src: Path, library_dir: Path, title: str, episode: int,
             outcome.quality = quality
         log.info("В медиатеку: %s", dst)
         return dst
+
+
+def library_overview(cfg) -> str:
+    """Read-only inventory; capacity belongs to the filesystem, not each category."""
+    import html
+    import os
+    import shutil
+    from .models import MEDIA_CATEGORIES
+    gb = 1024 ** 3
+    lines = ["📁 <b>Медиатека</b>"]
+    devices = set()
+    for key, (label, _) in MEDIA_CATEGORIES.items():
+        if not category_ready(cfg, key):
+            lines.append(f"\n<b>{label}</b> — недоступна")
+            continue
+        folder = cfg.category_dir(key)
+        size = 0
+        titles = []
+        try:
+            for root, dirs, files in os.walk(folder, followlinks=False):
+                dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink() and not d.startswith('.')]
+                if Path(root) == folder:
+                    titles = sorted(dirs, key=str.casefold)
+                for name in files:
+                    path = Path(root) / name
+                    if not path.is_symlink():
+                        try:
+                            size += path.stat().st_size
+                        except FileNotFoundError:
+                            pass  # A download can be replaced while reading.
+            lines.append(f"\n<b>{label}</b> — {len(titles)} тайтлов, {size/gb:.2f} ГБ")
+            lines.extend('• ' + html.escape(title[:35]) for title in titles[:3])
+            if len(titles) > 3:
+                lines.append(f"… ещё {len(titles)-3}; полный список: /lib")
+            if not titles:
+                lines.append('Пока пусто')
+            device = folder.stat().st_dev
+            if device not in devices:
+                disk = shutil.disk_usage(folder)
+                devices.add(device)
+                lines.append(f"Хранилище: {(disk.total-disk.free)/gb:.1f} из {disk.total/gb:.1f} ГБ занято; свободно {disk.free/gb:.1f} ГБ")
+        except OSError:
+            lines.append('Не удалось прочитать размер или содержимое. Проверь подключение и права.')
+    lines.append('\nЁмкость указана для всего хранилища, включая другие файлы. Размеры в ГБ (1024³ байт).')
+    return '\n'.join(lines)
