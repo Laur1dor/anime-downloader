@@ -43,6 +43,29 @@ class IncidentTests(unittest.IsolatedAsyncioTestCase):
     async def notify(self, now):
         await self.store.incidents.notify(self.sender, self.updater, owner=1, now=now)
 
+    async def test_recovery_notice_daily_limit_and_uncertain_send_are_durable(self):
+        sender = AsyncMock(side_effect=TimeoutError())
+        op = self.op()
+        self.fail(op);self.succeed(op)
+        await self.store.incidents.notify_users(sender, owner=99, now=400)
+        await self.store.incidents.notify_users(sender, owner=99, now=500)
+        self.assertEqual(sender.await_count, 1)
+        other = self.op(resource='episode-10',start=1000)
+        self.fail(other,at=1001);self.succeed(other,at=1002)
+        await self.store.incidents.notify_users(sender, owner=99, now=2000)
+        self.assertEqual(sender.await_count, 1)
+        await self.store.incidents.notify_users(sender, owner=99, now=90000)
+        self.assertEqual(sender.await_count, 2)
+
+    async def test_recovery_notice_429_retries_after_delay(self):
+        sender = AsyncMock(side_effect=[TelegramRetryAfter(method=SendMessage(chat_id=1,text='x'),message='wait',retry_after=90), None])
+        op=self.op();self.fail(op);self.succeed(op)
+        await self.store.incidents.notify_users(sender, owner=99, now=400)
+        await self.store.incidents.notify_users(sender, owner=99, now=450)
+        self.assertEqual(sender.await_count,1)
+        await self.store.incidents.notify_users(sender, owner=99, now=492)
+        self.assertEqual(sender.await_count,2)
+
     async def test_user_recovery_notice_is_delayed_once_and_not_sent_without_proof(self):
         sender = AsyncMock()
         op = self.op()

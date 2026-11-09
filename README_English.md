@@ -100,3 +100,5 @@ the previous image and source; an independent watchdog handles coordinator death
 A single polling process has a short restart gap. The mechanism is opt-in and does
 not promise to repair every error. Configure the generator, credentials, paths and
 watchdog separately; operational dependencies are in `requirements-ops.txt`.
+
+Owner alerts include a profile link when a current Telegram username is available. Confirmed recovery of a newly observed user operation can send a short retry invitation, at most once per user per day. No automatic downloads or historical notification campaign. Blocked recipients are suppressed; uncertain sends are not repeated. Deploying code alone does not prove recovery.
