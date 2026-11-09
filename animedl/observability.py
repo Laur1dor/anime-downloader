@@ -306,12 +306,14 @@ class AuditStore:
         self._count = self.db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         self._last_prune = time.time()
 
-    async def start(self, notifier=None, *, owner_id=None, updater=None):
+    async def start(self, notifier=None, *, owner_id=None, updater=None, user_notifier=None, contact_resolver=None):
         global _current
         _current = self
         self.notifier = notifier
         self.owner_id = owner_id
         self.updater = updater
+        self.contact_resolver = contact_resolver
+        self.user_notifier = user_notifier
         self.log_handler = WarningCollector(self)
         for name in ('animedl', 'aiogram'):
             logging.getLogger(name).addHandler(self.log_handler)
@@ -359,8 +361,22 @@ class AuditStore:
         self._drain_logs()
         token = _monitor_io.set(True)
         try:
+            resolver = getattr(self, 'contact_resolver', None)
+            if resolver and time.time() >= getattr(self, '_next_contact_query', 0):
+                missing = self.db.execute('SELECT DISTINCT user_id FROM audit_incidents WHERE user_id IS NOT NULL '
+                    'AND user_id NOT IN (SELECT user_id FROM audit_contacts) LIMIT 1').fetchone()
+                if missing:
+                    self._next_contact_query = time.time() + 30
+                    uid = missing[0]
+                    self.incidents.profile(uid)
+                    try:
+                        chat = await asyncio.wait_for(resolver(uid), timeout=5)
+                        self.incidents.profile(uid, getattr(chat, 'username', None))
+                    except Exception:
+                        pass  # No retries or monitoring recursion for unavailable profiles.
             await self.incidents.notify(self.notifier, self.updater,
                                         owner=getattr(self, 'owner_id', None))
+            await self.incidents.notify_users(getattr(self, 'user_notifier', None), owner=getattr(self, 'owner_id', None))
         finally:
             _monitor_io.reset(token)
 
@@ -459,6 +475,11 @@ class AuditMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
         uid = user.id if user else None
+        if user and _current:
+            try:
+                _current.incidents.profile(uid, getattr(user, 'username', None))
+            except Exception:
+                log.warning("Audit contact unavailable")
         token = _user.set(uid)
         state = data.get("state")
         state_name = await state.get_state() if state else ""

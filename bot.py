@@ -62,6 +62,8 @@ async def main() -> None:
             max_events=cfg.audit_max_events, pg_max_events=cfg.audit_pg_max_events)
         await audit.start((lambda text: bot.send_message(cfg.admin_id, text)) if cfg.audit_alerts else None,
                           owner_id=cfg.admin_id,
+                          contact_resolver=bot.get_chat,
+                          user_notifier=lambda uid, text: bot.send_message(uid, text),
                           updater=(lambda mid, text: bot.edit_message_text(text, chat_id=cfg.admin_id, message_id=mid))
                           if cfg.audit_alerts else None)
     except Exception as exc:

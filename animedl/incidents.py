@@ -57,10 +57,69 @@ class Incidents:
             id INTEGER PRIMARY KEY CHECK(id=1), next_api REAL NOT NULL,
             failures INTEGER NOT NULL, digest_id INTEGER, evicted INTEGER NOT NULL);
             INSERT OR IGNORE INTO audit_notification_state VALUES(1,0,0,NULL,0);''')
+        db.executescript("""CREATE TABLE IF NOT EXISTS audit_contacts (
+            user_id INTEGER PRIMARY KEY,username TEXT,blocked INTEGER NOT NULL,next_notice REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS audit_recovery_notices (
+            id TEXT PRIMARY KEY,generation TEXT NOT NULL,done INTEGER NOT NULL,due REAL NOT NULL);""")
         if 'generation' not in {r[1] for r in db.execute('PRAGMA table_info(audit_incidents)')}:
             db.execute("ALTER TABLE audit_incidents ADD COLUMN generation TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE audit_incidents SET generation=hex(randomblob(16)) WHERE generation=''")
             db.commit()
+
+    def profile(self, uid, username=None):
+        import re
+        username = username if username and re.fullmatch(r'[A-Za-z0-9_]{5,32}', username) else None
+        self.db.execute('INSERT INTO audit_contacts(user_id,username,blocked,next_notice) VALUES(?,?,0,0) '
+                        'ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,blocked=0', (uid, username))
+        self.db.commit()
+
+    def contact(self, uid):
+        row = self.db.execute('SELECT username FROM audit_contacts WHERE user_id=?', (uid,)).fetchone()
+        if row and row[0]:
+            return f'<a href="https://t.me/{row[0]}">{uid}</a>'
+        return f'<a href="tg://user?id={uid}">{uid}</a> (нет username; ссылка по ID может не открыться)'
+
+    async def notify_users(self, sender, *, owner=None, now=None):
+        if not sender:
+            return
+        now = time.time() if now is None else now
+        if now < self.db.execute('SELECT next_api FROM audit_notification_state WHERE id=1').fetchone()[0]:
+            return
+        # No retroactive campaign: only newly observed delivery failures enter here.
+        row = self.db.execute("SELECT i.id,i.generation,i.closed_at,i.user_id FROM audit_incidents i "
+            "JOIN audit_recovery_notices n ON n.id=i.id AND n.generation=i.generation "
+            "WHERE i.state='resolved' AND n.done=0 AND n.due<=? AND i.user_id IS NOT NULL "
+            "AND i.user_id!=? ORDER BY i.closed_at LIMIT 1", (now, owner or 0)).fetchone()
+        if not row:
+            return
+        identity, generation, closed, uid = row
+        self.db.execute('INSERT OR IGNORE INTO audit_contacts VALUES(?,NULL,0,0)', (uid,))
+        blocked, next_notice = self.db.execute('SELECT blocked,next_notice FROM audit_contacts WHERE user_id=?', (uid,)).fetchone()
+        if blocked:
+            self.db.execute('UPDATE audit_recovery_notices SET done=1 WHERE id=? AND generation=?', (identity,generation))
+            self.db.commit()
+            return
+        if now < next_notice:
+            return
+        # Reserve before I/O: uncertain sends are not repeated after restart.
+        self.db.execute('UPDATE audit_recovery_notices SET done=1 WHERE id=? AND generation=?', (identity,generation))
+        self.db.execute('UPDATE audit_contacts SET next_notice=? WHERE user_id=?', (now+86400,uid))
+        self.db.execute('UPDATE audit_notification_state SET next_api=? WHERE id=1', (now+self.API_INTERVAL,))
+        self.db.commit()
+        text = ('Извини, при загрузке произошла ошибка. Работа этой операции снова подтверждена. '
+                'Если нужные серии не пришли, можешь повторить загрузку — отправь название или ссылку. '
+                'Автоматически заново ничего не скачиваем.')
+        try:
+            await asyncio.wait_for(sender(uid, text), timeout=5)
+        except Exception as exc:
+            from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+            if isinstance(exc, TelegramForbiddenError):
+                self.db.execute('UPDATE audit_contacts SET blocked=1 WHERE user_id=?', (uid,))
+            elif isinstance(exc, TelegramRetryAfter):
+                self.db.execute('UPDATE audit_recovery_notices SET done=0,due=? WHERE id=? AND generation=?',
+                                (now+max(30,exc.retry_after+1),identity,generation))
+                self.db.execute('UPDATE audit_contacts SET next_notice=? WHERE user_id=?', (now+max(30,exc.retry_after+1),uid))
+            self.db.commit()
 
     @staticmethod
     def identity(uid, details):
@@ -101,6 +160,10 @@ class Incidents:
                 (identity, uid, operation, key, 'open', 1, 0, now, now, None,
                  details.get('attempt_id'), 1, 0, now, None, 0, json.dumps(details, ensure_ascii=False), action, uuid.uuid4().hex))
             self.prune(0)
+        if uid is not None and operation in ('source_download', 'telegram_delivery', 'library_publish', 'title_parse', 'quality_menu'):
+            generation = self.db.execute('SELECT generation FROM audit_incidents WHERE id=?', (identity,)).fetchone()[0]
+            self.db.execute('INSERT INTO audit_recovery_notices VALUES(?,?,0,?) ON CONFLICT(id) DO UPDATE SET '
+                            'generation=excluded.generation,done=0,due=excluded.due', (identity,generation,now+300))
         return identity, 'open'
 
     def success(self, uid, details, now):
@@ -125,6 +188,8 @@ class Incidents:
         return identity
 
     def prune(self, cutoff):
+        self.db.execute("DELETE FROM audit_recovery_notices WHERE id NOT IN (SELECT id FROM audit_incidents)")
+        self.db.execute("DELETE FROM audit_contacts WHERE user_id NOT IN (SELECT user_id FROM audit_incidents WHERE user_id IS NOT NULL)")
         self.db.execute("DELETE FROM audit_incidents WHERE state='resolved' AND revision<=notified AND closed_at<?", (cutoff,))
         count = self.db.execute('SELECT COUNT(*) FROM audit_incidents').fetchone()[0]
         if count > self.limit:
@@ -190,6 +255,8 @@ class Incidents:
             text += f"\nПовторное открытие: {row['reopens']}."
         stamp = datetime.fromtimestamp(row['closed_at'] if row['state'] == 'resolved' else row['last_seen'], timezone.utc)
         text += '\n' + ('Подтверждено: ' if row['state'] == 'resolved' else 'Последнее событие: ') + stamp.strftime('%d.%m %H:%M UTC')
+        if row['user_id'] is not None:
+            text += '\nПользователь: ' + self.contact(row['user_id'])
         return text + f"\nСобытий: {row['count']}. Статус: " + ('решено' if row['state'] == 'resolved' else 'открыто')
 
     async def notify(self, sender, updater=None, *, owner=None, now=None):
@@ -215,6 +282,8 @@ class Incidents:
                 label = error_explanation(row['details'], row['action'])[0]
                 mark = '✅' if row['state'] == 'resolved' else '⚠'
                 text += f"{mark} {html.escape(label)} · {row['id']} · событий: {row['count']}\n"
+                if row['user_id'] is not None:
+                    text += self.contact(row['user_id']) + '\n'
             if counts['evicted']:
                 text += f"\nВытеснено лимитом хранения: {counts['evicted']}."
             message_id = digest_id

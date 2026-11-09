@@ -43,6 +43,36 @@ class IncidentTests(unittest.IsolatedAsyncioTestCase):
     async def notify(self, now):
         await self.store.incidents.notify(self.sender, self.updater, owner=1, now=now)
 
+    async def test_user_recovery_notice_is_delayed_once_and_not_sent_without_proof(self):
+        sender = AsyncMock()
+        op = self.op()
+        self.fail(op)
+        await self.store.incidents.notify_users(sender, owner=99, now=400)
+        sender.assert_not_awaited()
+        self.succeed(op)
+        await self.store.incidents.notify_users(sender, owner=99, now=400)
+        sender.assert_awaited_once()
+        self.assertEqual(sender.call_args.args[0], 1)
+        await self.store.incidents.notify_users(sender, owner=99, now=500)
+        self.assertEqual(sender.await_count, 1)
+
+    async def test_blocked_recovery_recipient_is_not_retried(self):
+        from aiogram.exceptions import TelegramForbiddenError
+        sender = AsyncMock(side_effect=TelegramForbiddenError(method=SendMessage(chat_id=1,text='x'),message='blocked'))
+        op = self.op()
+        self.fail(op);self.succeed(op)
+        await self.store.incidents.notify_users(sender, owner=99, now=400)
+        await self.store.incidents.notify_users(sender, owner=99, now=90000)
+        self.assertEqual(sender.await_count, 1)
+        self.assertEqual(self.store.db.execute('SELECT blocked FROM audit_contacts').fetchone()[0], 1)
+
+    def test_profile_link_uses_validated_username_and_updates(self):
+        self.store.incidents.profile(1, 'valid_name')
+        self.assertIn('https://t.me/valid_name', self.store.incidents.contact(1))
+        self.store.incidents.profile(1, 'bad<script>')
+        self.assertNotIn('script', self.store.incidents.contact(1))
+        self.assertNotIn('https://t.me/', self.store.incidents.contact(1))
+
     def test_only_matching_actor_operation_resource_and_proof_can_resolve(self):
         op = self.op()
         self.fail(op)
