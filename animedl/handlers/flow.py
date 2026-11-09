@@ -325,7 +325,7 @@ async def _resolve_quality_options(state: FSMContext) -> list[int]:
 async def _quality_menu(state: FSMContext, qs: list[int]):
     import html
     failed = (await state.get_data()).get("quality_failed_providers", [])
-    text = "Выбери качество:"
+    text = "Проверены плееры с выбранной озвучкой. Выбери доступное качество:"
     kb = quality_kb(qs)
     if failed:
         text += "\n⚠ Не удалось проверить: " + html.escape(", ".join(failed))
@@ -770,11 +770,25 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
         lines.append(f"Ещё {len(noted) - shown} примечаний; итоги доставки указаны выше.")
     try:
         await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔄 Повторить неудавшиеся", callback_data="retry_failed")
+            InlineKeyboardButton(text="🔄 Повторить неудавшиеся", callback_data="retry_failed"),
+            InlineKeyboardButton(text="Выбрать другое качество", callback_data="retry_quality")
         ]]) if failures else None)
     except Exception:
         pass
     return [result_numbers[i] for i, r in enumerate(results) if r.status in ("error", "partial")]
+
+
+@router.callback_query(DownloadFlow.confirm, F.data == "retry_quality")
+async def on_retry_quality(cq: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("retry_message") != cq.message.message_id:
+        await cq.answer("Это устаревший результат")
+        return
+    if get_job(cq.message.chat.id):
+        await cq.answer("Дождись завершения текущей загрузки")
+        return
+    await cq.answer("Проверяю плееры с выбранной озвучкой")
+    await _ask_quality(cq, state)
 
 
 # ---------- управление задачей: пауза / продолжить / стоп ----------

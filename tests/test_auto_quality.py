@@ -82,6 +82,18 @@ class AutoProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.cfg.tmp_dir.iterdir()), [])
         return result
 
+    async def test_unavailable_quality_checks_same_voice_and_offers_alternatives(self):
+        self.parser.fetch_episode_players.return_value = self.buttons + [PlayerButton('Other', 'Aloha', 'other')]
+        self.extract.side_effect = lambda b: [VideoVariant(720, b.provider)]
+        result = await self.run_episode()
+        self.assertEqual(result.status, 'error')
+        self.assertFalse(result.source_failed)
+        self.assertIn('720p', result.note)
+        self.assertIn('Выбрать другое качество', result.note)
+        self.assertEqual({c.args[0].voice for c in self.extract.call_args_list}, {'V'})
+        self.assertEqual(self.extract.await_count, 3)
+        self.download.assert_not_awaited()
+
     async def test_auto_finds_1080_on_another_player_and_caches_actual_provider(self):
         result = await self.run_episode()
         self.assertEqual(result.telegram, 'sent')

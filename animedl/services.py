@@ -98,6 +98,10 @@ def _source_error_note(error: Exception) -> str:
     return str(error)
 
 
+class QualityUnavailable(ValueError):
+    pass
+
+
 @dataclass
 class EpisodeResult:
     episode: int
@@ -334,6 +338,7 @@ async def process_episode(
                     candidates = [button]
                 result = None
                 last_source_error = None
+                available_qualities = set()
                 for player_index, button in enumerate(candidates):
                     try:
                         for attempt in range(3):
@@ -345,6 +350,7 @@ async def process_episode(
                                 await on_status(f"{tag}: получаю видео…")
                                 # Refresh signed links, keeping the selected voice and provider.
                                 variants = await extract_variants(button)
+                                available_qualities.update(v.quality for v in variants if v.quality > 0 and v.quality != quality)
                                 if auto_provider:
                                     variant = next((v for v in variants if v.quality == quality), None)
                                     if variant is None:
@@ -412,7 +418,9 @@ async def process_episode(
                 if result is None:
                     if last_source_error and _retryable_source_error(last_source_error):
                         raise last_source_error
-                    raise ValueError(f"Качество {quality}p недоступно у работающих плееров этой озвучки; качество не снижено")
+                    raise QualityUnavailable(f"Проверены другие плееры с той же озвучкой: настоящее {quality}p не найдено. "
+                                             + ("Доступно: " + ", ".join(f"{q}p" for q in sorted(available_qualities, reverse=True)) + ". " if available_qualities else "Проверить доступное качество сейчас не удалось. ")
+                                             + "Нажми «Выбрать другое качество». Озвучка сохранена, качество не снижено автоматически.")
             res.size_bytes = result.size_bytes
             if cancel_check and cancel_check():
                 raise DownloadCancelled()
@@ -422,7 +430,7 @@ async def process_episode(
             return audit_result(res)
         except Exception as e:
             capture(e, "source_error", user_id, **source_proof, job_id=audit_job, provider=provider)
-            res.source_failed = True
+            res.source_failed = not isinstance(e, QualityUnavailable)
             if wants_tg and res.telegram == "skipped":
                 res.telegram = "error"
             if wants_library:
