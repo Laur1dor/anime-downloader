@@ -57,6 +57,16 @@ class IncidentTests(unittest.IsolatedAsyncioTestCase):
         await self.store.incidents.notify_users(sender, owner=99, now=90000)
         self.assertEqual(sender.await_count, 2)
 
+    async def test_one_users_cooldown_does_not_block_other_users(self):
+        sender=AsyncMock()
+        op=self.op();self.fail(op);self.succeed(op)
+        await self.store.incidents.notify_users(sender,owner=99,now=400)
+        other=self.op(resource='next',start=500)
+        self.fail(other,at=501);self.succeed(other,at=502)
+        self.fail(other,uid=2,at=501);self.succeed(other,uid=2,at=502)
+        await self.store.incidents.notify_users(sender,owner=99,now=900)
+        self.assertEqual(sender.call_args.args[0],2)
+
     async def test_recovery_notice_429_retries_after_delay(self):
         sender = AsyncMock(side_effect=[TelegramRetryAfter(method=SendMessage(chat_id=1,text='x'),message='wait',retry_after=90), None])
         op=self.op();self.fail(op);self.succeed(op)

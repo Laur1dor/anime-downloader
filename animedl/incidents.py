@@ -89,7 +89,8 @@ class Incidents:
         row = self.db.execute("SELECT i.id,i.generation,i.closed_at,i.user_id FROM audit_incidents i "
             "JOIN audit_recovery_notices n ON n.id=i.id AND n.generation=i.generation "
             "WHERE i.state='resolved' AND n.done=0 AND n.due<=? AND i.user_id IS NOT NULL "
-            "AND i.user_id!=? ORDER BY i.closed_at LIMIT 1", (now, owner or 0)).fetchone()
+            "AND i.user_id!=? AND i.user_id NOT IN (SELECT user_id FROM audit_contacts WHERE next_notice>?) "
+            "ORDER BY i.closed_at LIMIT 1", (now, owner or 0, now)).fetchone()
         if not row:
             return
         identity, generation, closed, uid = row
