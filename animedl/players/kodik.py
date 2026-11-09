@@ -115,8 +115,35 @@ class KodikExtractor(PlayerExtractor):
                 quality=quality, url=src, kind=kind,
                 headers={"Referer": origin + "/", "User-Agent": UA},
             ))
+        # Some CDN aliases advertise 720p while their media playlist contains
+        # only 480.mp4 segments. Verify before exposing a quality or downloading.
+        async with new_client() as client:
+            for variant in variants:
+                if variant.kind == "hls":
+                    response = await client.get(variant.url, headers=variant.headers)
+                    response.raise_for_status()
+                    variant.quality = manifest_quality(response.text, variant.quality)
+        unique = {}
+        for variant in variants:
+            unique.setdefault(variant.quality, variant)
+        variants = list(unique.values())
         variants.sort(key=lambda v: v.quality, reverse=True)
         if not variants:
             raise ExtractError("Kodik: /ftor не вернул ссылок")
         log.info("Kodik: %s -> качества %s", vid, [v.quality for v in variants])
         return variants
+
+
+def manifest_quality(manifest: str, advertised: int) -> int:
+    """Only downgrade an explicit, uniform Kodik media segment quality."""
+    if not manifest.lstrip().startswith('#EXTM3U') or '#EXT-X-STREAM-INF' in manifest:
+        return advertised
+    segments = [line.strip() for line in manifest.splitlines()
+                if line.strip() and not line.startswith('#')]
+    qualities = [re.search(r'(?:^|/)(240|360|480|720|1080)\.mp4(?::|/|\?|$)', line)
+                 for line in segments]
+    if qualities and all(qualities):
+        values = {int(match.group(1)) for match in qualities}
+        if len(values) == 1:
+            return min(advertised, values.pop())
+    return advertised
