@@ -430,6 +430,13 @@ async def process_episode(
             return audit_result(res)
         except Exception as e:
             capture(e, "source_error", user_id, **source_proof, job_id=audit_job, provider=provider)
+            try:
+                from . import observability
+                from .recheck import save_case
+                if observability._current and user_id is not None:
+                    save_case(observability._current,user_id,source_proof,title,episode,voice,quality)
+            except Exception:
+                log.warning("Recheck parameters could not be saved", extra={'audit_recorded': True})
             res.source_failed = not isinstance(e, QualityUnavailable)
             if wants_tg and res.telegram == "skipped":
                 res.telegram = "error"

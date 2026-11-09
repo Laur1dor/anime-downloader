@@ -270,3 +270,27 @@ async def cmd_speed(message: Message, cfg: Config) -> None:
     await message.answer(
         f"✅ Лимит отдачи: <b>{'снят' if mbit == 0 else str(mbit) + ' Мбит/с'}</b>." + applied
     )
+
+
+@router.message(Command("recheck"))
+async def cmd_recheck(message: Message, cfg: Config, audit: AuditStore) -> None:
+    if not _is_admin(message,cfg):return
+    import re
+    from ..jobcontrol import ACTIVE, start_job, end_job
+    from ..recheck import verify_case
+    identity=(message.text or '').split(maxsplit=1)
+    if len(identity)!=2 or not re.fullmatch(r'[0-9a-f]{16}',identity[1]):
+        await message.answer('Проверка после фикса: /recheck КОД_ОШИБКИ из /errors. Видео пользователю не отправляется.')
+        return
+    if ACTIVE:
+        await message.answer('Сначала дождись завершения загрузок. Проверка не запущена.')
+        return
+    ctrl=start_job(message.chat.id)
+    await message.answer('Проверяю исходную серию, озвучку и качество полным скачиванием. Видео удалю после проверки.')
+    try:
+        result=await verify_case(audit,cfg,identity[1],cancel_check=lambda:ctrl.cancelled)
+        await message.answer(html.escape(result))
+    except Exception as exc:
+        log.info('Owner recheck failed (%s)',type(exc).__name__)
+        await message.answer('Восстановление не подтверждено. '+html.escape(str(exc))[:800] if isinstance(exc,ValueError) else 'Проверка завершилась ошибкой. Уведомление об исправлении не отправлено.')
+    finally:end_job(message.chat.id)

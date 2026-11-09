@@ -102,3 +102,5 @@ not promise to repair every error. Configure the generator, credentials, paths a
 watchdog separately; operational dependencies are in `requirements-ops.txt`.
 
 Owner alerts include a profile link when a current Telegram username is available. Confirmed recovery of a newly observed user operation can send a short retry invitation, at most once per user per day. No automatic downloads or historical notification campaign. Blocked recipients are suppressed; uncertain sends are not repeated. Deploying code alone does not prove recovery.
+
+After a fix, the owner can run `/recheck INCIDENT_ID` to fully download the saved failing episode without sending media or publishing to a library. Only matching voice, quality and validated media can resolve a source incident and trigger the rate-limited recovery notice. Temporary media is removed. Legacy incidents without saved context cannot be replayed by guessing.
