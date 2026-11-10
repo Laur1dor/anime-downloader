@@ -42,9 +42,18 @@ jobs:
         run: python scripts/export_public.py "$RUNNER_TEMP/public-check"
   images:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t anime-downloader-check .
       - run: docker run --rm anime-downloader-check python -c "import animedl.services; import animedl.download.splitter"
-      - run: docker build -f Dockerfile.botapi -t anime-bot-api-check .
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.botapi
+          load: true
+          tags: anime-bot-api-check
+          cache-from: type=gha,scope=botapi-native
+          cache-to: type=gha,mode=max,scope=botapi-native
+      - run: docker run --rm --entrypoint telegram-bot-api anime-bot-api-check --version

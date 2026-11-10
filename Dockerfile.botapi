@@ -1,9 +1,25 @@
-# telegram-bot-api + tc (шейпинг egress-загрузки в Telegram) поверх офиц. образа.
-FROM aiogram/telegram-bot-api:latest
+# Reproducible Bot API 10.3 build with a long upload-response timeout.
+FROM alpine:3.21 AS native
+ARG BOT_API_SOURCE_REV=114fe93d27f8a06554f04b375ad03b90aa98d61b
+RUN apk add --no-cache alpine-sdk linux-headers git zlib-dev openssl-dev gperf cmake python3
+WORKDIR /src
+RUN git init . && git remote add origin https://github.com/tdlib/telegram-bot-api.git \
+ && git fetch --depth 1 origin "$BOT_API_SOURCE_REV" && git checkout --detach FETCH_HEAD \
+ && git submodule update --init --recursive --depth 1
+RUN python3 -c "from pathlib import Path;p=Path('telegram-bot-api/HttpServer.h');s=p.read_text();assert s.count('IDLE_TIMEOUT = 500;')==1;s=s.replace('IDLE_TIMEOUT = 500;', 'IDLE_TIMEOUT = 7200;');p.write_text(s)"
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O2 -DNDEBUG' \
+ && cmake --build build --target telegram-bot-api -j 2 \
+ && strip build/telegram-bot-api
+RUN python3 -c "import json,hashlib;from pathlib import Path;p=Path('build/telegram-bot-api');Path('build/manifest.json').write_text(json.dumps(dict(source_revision='$BOT_API_SOURCE_REV',idle_timeout=7200,sha256=hashlib.sha256(p.read_bytes()).hexdigest())))"
 
+FROM scratch AS binary-export
+COPY --from=native /src/build/telegram-bot-api /telegram-bot-api
+COPY --from=native /src/build/manifest.json /manifest.json
+
+FROM aiogram/telegram-bot-api@sha256:be04d4c3ab409f4a10e317e10fd111ddc0bd3171793babc72c1c05ab6060e44c
 RUN apk add --no-cache iproute2
-
+COPY --from=native /src/build/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY --from=native /src/build/manifest.json /usr/local/share/botapi-build.json
 COPY botapi-entrypoint.sh /shaped-entrypoint.sh
 RUN chmod +x /shaped-entrypoint.sh && sed -i 's/\r$//' /shaped-entrypoint.sh
-
 ENTRYPOINT ["/shaped-entrypoint.sh"]
