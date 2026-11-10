@@ -283,11 +283,11 @@ async def process_episode(
         res.note = "; ".join(notes)
         return audit_result(res)
 
-    cached = cache.get(key, expected_quality=quality) if wants_tg and not auto_provider else None
+    cached = _cached_video(cache,key,quality,cfg) if wants_tg and not auto_provider else None
     if wants_tg and auto_provider:
         for cached_provider in ("AniBoom", "CVH", "Kodik", "Alloha", "PLPlayer"):
             cached_key = make_cache_hash(title.site, cache_identity, episode.number, voice, cached_provider, quality)
-            cached = cache.get(cached_key, expected_quality=quality)
+            cached = _cached_video(cache,cached_key,quality,cfg)
             if cached:
                 provider = cached_provider
                 caption = html.escape(f"{title.title} — {tag.lower()} • {voice} • {cached_provider} • {quality}p")
@@ -362,7 +362,7 @@ async def process_episode(
                                 caption = video_caption(variant.quality)
                                 key = make_cache_hash(title.site, cache_identity, episode.number, voice, provider, variant.quality)
                                 if wants_tg and res.telegram == "skipped":
-                                    cached = cache.get(key, expected_quality=variant.quality)
+                                    cached = _cached_video(cache,key,variant.quality,cfg)
                                     if cached:
                                         await cached_send(cached)
                                         if not wants_library and res.telegram == "cached":
@@ -615,3 +615,9 @@ def telegram_upload_limit(cfg):
     if part_mb>0 and getattr(cfg, 'tg_api_base_url', '') and getattr(cfg, 'tg_api_local_mode', False):
         limit = min(limit, max(8,min(1900,part_mb)) * 1024**2)
     return limit
+
+
+def _cached_video(cache, key, quality, cfg):
+    if isinstance(cache, CacheStore):
+        return cache.get(key,expected_quality=quality,whole_limit_bytes=telegram_upload_limit(cfg))
+    return cache.get(key,expected_quality=quality)

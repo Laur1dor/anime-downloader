@@ -28,15 +28,18 @@ class CacheStore:
         self._conn.execute("DELETE FROM upload_parts WHERE created_at < datetime('now', '-2 days')")
         self._conn.commit()
 
-    def get(self, key: str, expected_quality: int | None = None) -> str | None:
+    def get(self, key: str, expected_quality: int | None = None, *, whole_limit_bytes: int | None = None) -> str | None:
         # Older versions could hash the requested quality while saving a lower one.
         # Validate the stored media quality before reusing those historical rows.
         if expected_quality is None:
-            cur = self._conn.execute("SELECT file_id FROM cache WHERE hash = ?", (key,))
+            cur = self._conn.execute("SELECT file_id,size_bytes FROM cache WHERE hash = ?", (key,))
         else:
             cur = self._conn.execute(
-                "SELECT file_id FROM cache WHERE hash = ? AND quality = ?", (key, expected_quality))
+                "SELECT file_id,size_bytes FROM cache WHERE hash = ? AND quality = ?", (key, expected_quality))
         row = cur.fetchone()
+        if row and whole_limit_bytes is not None and row[0].startswith('parts:') and (row[1] or 0)<=whole_limit_bytes:
+            # Do not perpetuate cached fragments from an older, smaller upload cap.
+            return None
         return row[0] if row else None
 
     def put(self, key: str, file_id: str, title: str = "",
