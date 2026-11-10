@@ -105,4 +105,23 @@ Owner alerts include a profile link when a current Telegram username is availabl
 
 After a fix, the owner can run `/recheck INCIDENT_ID` to fully download the saved failing episode without sending media or publishing to a library. Only matching voice, quality and validated media can resolve a source incident and trigger the rate-limited recovery notice. Temporary media is removed. Legacy incidents without saved context cannot be replayed by guessing.
 
-The local Bot API has an HTTP idle timeout independent of the client timeout. `TELEGRAM_UPLOAD_PART_MB` defaults to 128 MiB to bound individual uploads even below the 2 GB API limit. Parts retain original quality, accepted-part progress is stored, and uncertain uploads are not automatically repeated. Splitting checks available disk space.
+Episodes within the Telegram file limit are sent as one file. The pinned Bot API 10.3 source build in Dockerfile.botapi raises the server HTTP idle timeout to 7200 seconds; the client also allows two hours. Splitting preserves quality and is used for files exceeding the Telegram limit. TELEGRAM_UPLOAD_PART_MB defaults to 0 (no additional splitting). Positive values are optional overrides for unusual networks. Build the native server in GitHub Actions for weak production hosts. Uncertain sends are never automatically repeated.
+
+
+## Feedback and request outcomes
+
+Users can reply to bot videos/notifications or use `/feedback text`. Completed requests
+provide success/problem buttons. Transport delivery and user confirmation are stored
+separately; no response remains unknown. Requests retain the title, selected episodes,
+voice, quality and delivery mode.
+
+In the owner's private bot chat, `/support [USER_ID]` shows request outcomes,
+`/user_log USER_ID` lists message previews and `/user_message USER_ID MESSAGE_ID`
+shows the complete stored text. Reply to a support report or use `/reply USER_ID text`.
+Current outgoing texts, latest message edits, captions, uncertain sends and voluntary
+feedback are retained locally for up to 30 days. Media is not copied to the owner.
+Limits are 10000 message records and 1000 requests/queued reports; evictions and failed
+notification attempts are visible. Feedback is limited to 20 messages per user per day.
+Duplicate button presses are suppressed, reports coalesce, and notification calls share
+the rate-limited monitoring queue. Legacy history is not fabricated; quotes of older
+bot notifications can be retained when users reply to them.

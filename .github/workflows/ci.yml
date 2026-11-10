@@ -57,3 +57,17 @@ jobs:
           cache-from: type=gha,scope=botapi-native
           cache-to: type=gha,mode=max,scope=botapi-native
       - run: docker run --rm --entrypoint telegram-bot-api anime-bot-api-check --version
+
+      - name: Export verified Bot API binary
+        run: |
+          mkdir -p "$RUNNER_TEMP/botapi-native"
+          container_id=$(docker create anime-bot-api-check)
+          docker cp "$container_id:/usr/local/bin/telegram-bot-api" "$RUNNER_TEMP/botapi-native/telegram-bot-api"
+          docker cp "$container_id:/usr/local/share/botapi-build.json" "$RUNNER_TEMP/botapi-native/manifest.json"
+          docker rm "$container_id"
+          python3 -c "import json,hashlib,os;from pathlib import Path;p=Path(os.environ['RUNNER_TEMP'])/'botapi-native';m=json.loads((p/'manifest.json').read_text());assert m['idle_timeout']==7200;assert hashlib.sha256((p/'telegram-bot-api').read_bytes()).hexdigest()==m['sha256']"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botapi-native-linux-amd64
+          path: ${{ runner.temp }}/botapi-native/
+          retention-days: 3

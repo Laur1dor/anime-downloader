@@ -10,7 +10,7 @@ from aiogram import Dispatcher
 from animedl.cache.store import CacheStore
 from animedl.catalog import CatalogStore
 from animedl.config import load_config
-from animedl.handlers import admin, common, flow, search
+from animedl.handlers import admin, common, flow, search, support
 from animedl.handlers.access import AccessMiddleware
 from animedl.logging_setup import setup_logging
 from animedl.observability import AuditMiddleware, AuditStore
@@ -62,6 +62,8 @@ async def main() -> None:
             max_events=cfg.audit_max_events, pg_max_events=cfg.audit_pg_max_events)
         await audit.start((lambda text: bot.send_message(cfg.admin_id, text)) if cfg.audit_alerts else None,
                           owner_id=cfg.admin_id,
+                          support_sender=(lambda text: bot.send_message(cfg.admin_id,text,parse_mode=None)) if cfg.audit_alerts else None,
+                          support_updater=(lambda mid,text: bot.edit_message_text(text,chat_id=cfg.admin_id,message_id=mid,parse_mode=None)) if cfg.audit_alerts else None,
                           contact_resolver=bot.get_chat,
                           user_notifier=lambda uid, text: bot.send_message(uid, text),
                           updater=(lambda mid, text: bot.edit_message_text(text, chat_id=cfg.admin_id, message_id=mid))
@@ -92,6 +94,7 @@ async def main() -> None:
     dp.message.middleware(guard)
     dp.callback_query.middleware(guard)
 
+    dp.include_router(support.router)
     dp.include_router(common.router)
     dp.include_router(admin.router)
     dp.include_router(search.router)

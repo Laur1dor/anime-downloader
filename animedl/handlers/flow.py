@@ -659,6 +659,18 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
                       voice, provider, quality, ctrl, chat_id, status, on_status,
                       *, user_id=None, delivery="telegram", library_title=None, library_season=None, library_season_name="", library_category=None):
     total = len(nums)
+    from ..support import current_support, safe_finish
+    support_store=current_support()
+    support_id=None
+    if support_store and user_id is not None and user_id!=cfg.admin_id:
+        try:
+            selected=", ".join(f"S{ep_by_num[n].season or '?'}E{ep_by_num[n].number}" for n in nums[:20] if n in ep_by_num)
+            description=f"{title.title} · {voice} · {quality}p · {delivery} · серий: {total} · {selected}"
+            support_id=support_store.begin(user_id,description,dict(expected=total,voice=voice,quality=quality,
+                delivery=delivery,url=title.url.split('?',1)[0].split('#',1)[0],
+                episodes=[dict(number=ep_by_num[n].number,season=ep_by_num[n].season) for n in nums if n in ep_by_num][:1000]))
+        except Exception:
+            log.warning('Support request journal unavailable',extra={'audit_recorded':True})
     await on_status(f"🚀 Начинаю загрузку: {total} серий ({voice} · {quality}p)")
 
     results = []
@@ -740,6 +752,8 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
 
     # Report each selected delivery channel, including partial success.
     if getattr(ctrl, 'recipient_unavailable', False) or any(r.telegram_forbidden for r in results):
+        if support_id:
+            safe_finish(support_store,support_id,'blocked',dict(expected=total,delivered=sum(r.status in ('sent_new','sent_cached') for r in results)))
         return []
     import html
     was_cancelled = ctrl.cancelled or any(r.status == "cancelled" for r in results)
@@ -768,11 +782,18 @@ async def _run_season(bot, cfg, cache, parser, title, ep_by_num, nums,
         shown += 1
     if shown < len(noted):
         lines.append(f"Ещё {len(noted) - shown} примечаний; итоги доставки указаны выше.")
+    buttons=[]
+    if failures:
+        buttons.append([InlineKeyboardButton(text="🔄 Повторить неудавшиеся",callback_data="retry_failed"),
+                        InlineKeyboardButton(text="Выбрать другое качество",callback_data="retry_quality")])
+    if support_id:
+        technical='cancelled' if was_cancelled else ('partial' if failures else 'delivered')
+        safe_finish(support_store,support_id,technical,dict(expected=total,delivered=sum(r.status in ('sent_new','sent_cached') for r in results),
+            results=[dict(episode=r.episode,season=r.season,telegram=r.telegram,library=r.library,status=r.status) for r in results][:1000]))
+        buttons.append([InlineKeyboardButton(text="👍 Получилось",callback_data='fb:yes:'+support_id),
+                        InlineKeyboardButton(text="👎 Не получилось",callback_data='fb:no:'+support_id)])
     try:
-        await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔄 Повторить неудавшиеся", callback_data="retry_failed"),
-            InlineKeyboardButton(text="Выбрать другое качество", callback_data="retry_quality")
-        ]]) if failures else None)
+        await status.edit_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
     except Exception:
         pass
     return [result_numbers[i] for i, r in enumerate(results) if r.status in ("error", "partial")]

@@ -52,7 +52,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TelegramNetworkError):
             await send_video_file(bot, 1, Path('example.mp4'), width=640, height=360, duration=10)
         self.assertEqual(bot.send_video.await_count, 1)
-        self.assertEqual(bot.send_video.call_args.kwargs['request_timeout'], 3600)
+        self.assertEqual(bot.send_video.call_args.kwargs['request_timeout'], 7200)
 
     async def test_retry_button_retries_only_failed_selection(self):
         status = SimpleNamespace(edit_text=AsyncMock())

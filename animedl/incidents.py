@@ -190,7 +190,11 @@ class Incidents:
 
     def prune(self, cutoff):
         self.db.execute("DELETE FROM audit_recovery_notices WHERE id NOT IN (SELECT id FROM audit_incidents)")
-        self.db.execute("DELETE FROM audit_contacts WHERE user_id NOT IN (SELECT user_id FROM audit_incidents WHERE user_id IS NOT NULL)")
+        keep=''
+        for table,column in (('support_requests','uid'),('support_messages','uid')):
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                keep+=f' AND user_id NOT IN (SELECT {column} FROM {table})'
+        self.db.execute("DELETE FROM audit_contacts WHERE user_id NOT IN (SELECT user_id FROM audit_incidents WHERE user_id IS NOT NULL)"+keep)
         self.db.execute("DELETE FROM audit_incidents WHERE state='resolved' AND revision<=notified AND closed_at<?", (cutoff,))
         count = self.db.execute('SELECT COUNT(*) FROM audit_incidents').fetchone()[0]
         if count > self.limit:

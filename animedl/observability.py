@@ -217,6 +217,8 @@ class AuditStore:
         self._db_failed = False
         self._local_failed = False
         self.incidents = Incidents(self.db)
+        from .support import SupportStore
+        self.support = SupportStore(self.db)
         self.log_queue = queue.Queue(maxsize=256)
         self.log_overflow = 0
         self.log_overflow_lock = threading.Lock()
@@ -306,12 +308,14 @@ class AuditStore:
         self._count = self.db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
         self._last_prune = time.time()
 
-    async def start(self, notifier=None, *, owner_id=None, updater=None, user_notifier=None, contact_resolver=None):
+    async def start(self, notifier=None, *, owner_id=None, updater=None, user_notifier=None, contact_resolver=None, support_sender=None, support_updater=None):
         global _current
         _current = self
         self.notifier = notifier
         self.owner_id = owner_id
         self.updater = updater
+        self.support_sender=support_sender
+        self.support_updater=support_updater
         self.contact_resolver = contact_resolver
         self.user_notifier = user_notifier
         self.log_handler = WarningCollector(self)
@@ -376,12 +380,16 @@ class AuditStore:
                         pass  # No retries or monitoring recursion for unavailable profiles.
             await self.incidents.notify(self.notifier, self.updater,
                                         owner=getattr(self, 'owner_id', None))
+            await self.support.tick(getattr(self,'support_sender',None),getattr(self,'support_updater',None))
             await self.incidents.notify_users(getattr(self, 'user_notifier', None), owner=getattr(self, 'owner_id', None))
         finally:
             _monitor_io.reset(token)
 
     async def _tick(self):
         self.prune()
+        if time.time()-getattr(self,"_last_support_prune",0)>60:
+            self.support.prune()
+            self._last_support_prune=time.time()
         await self._alerts()
         if self.dsn and time.time() >= self._next_flush:
             proof = operation('postgres_mirror', scope='service')

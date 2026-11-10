@@ -544,11 +544,17 @@ async def process_episode(
                                 if user_id is not None and user_id == cfg.admin_id
                                 and getattr(cfg, "tg_api_base_url", "")
                                 and getattr(cfg, "tg_api_local_mode", False) else None)))
+                    upload_started=time.monotonic()
+                    next_heartbeat=upload_started+30
                     try:
                         while not upload.done():
                             if cancel_check and cancel_check():
                                 raise DownloadCancelled()
                             await asyncio.wait({upload}, timeout=0.5)
+                            if not upload.done() and time.monotonic()>=next_heartbeat:
+                                elapsed=int((time.monotonic()-upload_started)//60)
+                                await on_status(f"{tag}: отправка в Telegram{suffix} продолжается, прошло {elapsed} мин. Качество сохранено.")
+                                next_heartbeat=time.monotonic()+30
                         msg = upload.result()
                     finally:
                         if not upload.done():
@@ -605,6 +611,7 @@ async def process_episode(
 def telegram_upload_limit(cfg):
     """Keep local Bot API uploads below its independent HTTP idle timeout."""
     limit = cfg.max_tg_bytes
-    if getattr(cfg, 'tg_api_base_url', '') and getattr(cfg, 'tg_api_local_mode', False):
-        limit = min(limit, max(8,min(1900,getattr(cfg, 'telegram_upload_part_mb',128))) * 1024**2)
+    part_mb=getattr(cfg,'telegram_upload_part_mb',0)
+    if part_mb>0 and getattr(cfg, 'tg_api_base_url', '') and getattr(cfg, 'tg_api_local_mode', False):
+        limit = min(limit, max(8,min(1900,part_mb)) * 1024**2)
     return limit

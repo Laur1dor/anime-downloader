@@ -88,6 +88,8 @@ def build_bot(cfg: Config) -> Bot:
         log.info("Использую облачный Bot API через httpx-транспорт.")
     session.middleware(CallbackAcknowledgementMiddleware())
     session.middleware(TelegramAccessProofMiddleware())
+    from .support import OutgoingSupportMiddleware
+    session.middleware(OutgoingSupportMiddleware())
     return Bot(
         token=cfg.bot_token,
         session=session,
@@ -122,7 +124,7 @@ async def send_video_file(
         duration=duration or None,
         caption=caption,
         supports_streaming=True,
-        request_timeout=3600,
+        request_timeout=7200,
     ), retry_transport=False)
 
 
