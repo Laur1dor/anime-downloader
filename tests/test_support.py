@@ -145,3 +145,9 @@ class SupportTests(unittest.IsolatedAsyncioTestCase):
   cq=NS(data='fb:no:'+identity,from_user=NS(id=17),message=message,answer=AsyncMock())
   await on_outcome(cq,self.store);await on_outcome(cq,self.store)
   self.assertEqual(message.answer.await_count,1)
+
+ async def test_owner_command_in_reply_is_not_sent_to_the_customer(self):
+  self.s.enqueue('report',17,'feedback')
+  await self.s.tick(AsyncMock(return_value=NS(message_id=100)),now=100)
+  owner=self.message(99,text='/support 17',reply=100)
+  self.assertFalse(await _feedback_message(owner,NS(admin_id=99),self.store))

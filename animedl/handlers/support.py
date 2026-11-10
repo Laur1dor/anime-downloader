@@ -12,8 +12,9 @@ def _owner(message,cfg):
     return bool(message.from_user and message.from_user.id==cfg.admin_id and message.chat.type=="private" and message.chat.id==cfg.admin_id)
 
 async def _feedback_message(message:Message,cfg:Config,audit:AuditStore,state=None,bot=None):
-    if not audit or not message.from_user or not message.text or not message.text.strip() or message.chat.type!="private":return False
+    if not message.from_user or not message.text or not message.text.strip() or message.chat.type!="private":return False
     if message.text.split()[0].split('@')[0]=='/feedback':return True
+    if not audit or message.text.startswith('/'):return False
     reply=message.reply_to_message
     if not reply:return False
     if message.from_user.id==cfg.admin_id:
@@ -27,6 +28,8 @@ async def _feedback_message(message:Message,cfg:Config,audit:AuditStore,state=No
 
 @router.message(_feedback_message)
 async def on_feedback(message:Message,cfg:Config,audit:AuditStore,bot) -> None:
+    if not audit:
+        await message.answer("Журнал обратной связи временно недоступен. Попробуй позже — сообщение не сохранено.");return
     uid=message.from_user.id;store=audit.support
     target=store.owner_target(message.reply_to_message.message_id) if message.reply_to_message and uid==cfg.admin_id else None
     if target:
