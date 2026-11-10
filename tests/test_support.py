@@ -151,3 +151,22 @@ class SupportTests(unittest.IsolatedAsyncioTestCase):
   await self.s.tick(AsyncMock(return_value=NS(message_id=100)),now=100)
   owner=self.message(99,text='/support 17',reply=100)
   self.assertFalse(await _feedback_message(owner,NS(admin_id=99),self.store))
+
+ async def test_real_dispatcher_routes_notification_reply_to_feedback(self):
+  from aiogram import Bot,Dispatcher,Router
+  from aiogram.types import Update,Message
+  from datetime import datetime,timezone
+  from animedl.handlers.support import on_feedback
+  class TestBot(Bot):
+   def __init__(self):super().__init__('123:TEST');self.methods=[]
+   async def __call__(self,method,request_timeout=None):
+    self.methods.append(method)
+    return Message(message_id=200,date=datetime.now(timezone.utc),chat={'id':17,'type':'private'},text='ack')
+  bot=TestBot();dp=Dispatcher();router=Router();router.message.register(on_feedback,_feedback_message);dp.include_router(router)
+  self.s.outgoing(17,100,'Извини за сбой. Можно повторить.')
+  update=Update(update_id=1,message=Message(message_id=101,date=datetime.now(timezone.utc),chat={'id':17,'type':'private'},from_user={'id':17,'is_bot':False,'first_name':'Test'},text='Все ещё не получается',reply_to_message=Message(message_id=100,date=datetime.now(timezone.utc),chat={'id':17,'type':'private'},from_user={'id':123,'is_bot':True,'first_name':'Bot'},text='Извини за сбой. Можно повторить.')))
+  try:
+   await dp.feed_update(bot,update,cfg=NS(admin_id=99),audit=self.store)
+   self.assertTrue(any('Все ещё не получается' in row[2] for row in self.s.messages(17)))
+   self.assertTrue(any('Спасибо!' in getattr(method,'text','') for method in bot.methods))
+  finally:await bot.session.close();await dp.storage.close()
