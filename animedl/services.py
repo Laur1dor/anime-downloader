@@ -521,8 +521,11 @@ async def process_episode(
             try:
                 result.meta.setdefault("upload_id", uuid.uuid4().hex)
                 await on_status(f"{tag}: подготовка отправки в Telegram…")
-                parts = await split_for_telegram(result, cfg.max_tg_bytes, cancel_check=cancel_check)
-                session = f"{result.meta['upload_id']}:{chat_id}:{cfg.max_tg_bytes}"
+                upload_limit = telegram_upload_limit(cfg)
+                if result.size_bytes > upload_limit:
+                    await on_status(f"{tag}: разделяю видео на части до {upload_limit // 1024**2} МБ без потери качества, чтобы отправка не обрывалась…")
+                parts = await split_for_telegram(result, upload_limit, cancel_check=cancel_check)
+                session = f"{result.meta['upload_id']}:{chat_id}:{upload_limit}"
                 completed = cache.get_parts(session) if isinstance(cache, CacheStore) else {}
                 file_ids = []
                 caption = video_caption(variant.quality)
@@ -597,3 +600,11 @@ async def process_episode(
                 log.warning("Recovery cache unavailable (%s)", type(exc).__name__, extra={'audit_recorded': True})
                 notes.append("Сохранить видео для повтора не удалось")
         return finish()
+
+
+def telegram_upload_limit(cfg):
+    """Keep local Bot API uploads below its independent HTTP idle timeout."""
+    limit = cfg.max_tg_bytes
+    if getattr(cfg, 'tg_api_base_url', '') and getattr(cfg, 'tg_api_local_mode', False):
+        limit = min(limit, max(8,min(1900,getattr(cfg, 'telegram_upload_part_mb',128))) * 1024**2)
+    return limit

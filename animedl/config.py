@@ -47,6 +47,7 @@ class Config:
     audit_retention_days: int = 30
     audit_max_events: int = 50000
     audit_pg_max_events: int = 100000
+    telegram_upload_part_mb: int = 128
     audit_alerts: bool = True
     jellyfin_url: str = ""
     jellyfin_api_key: str = field(default="", repr=False)
@@ -111,6 +112,7 @@ def load_config() -> Config:
         audit_alerts=_get("AUDIT_ALERTS", "1").lower() in ("1", "true", "yes"),
         jellyfin_url=_get("JELLYFIN_URL"),
         jellyfin_api_key=_get("JELLYFIN_API_KEY"),
+        telegram_upload_part_mb=max(8,min(1900,_get_int("TELEGRAM_UPLOAD_PART_MB",128))),
         media_root=(_path("MEDIA_ROOT", "") if _get("MEDIA_ROOT") else None),
     )
     cfg.tmp_dir.mkdir(parents=True, exist_ok=True)

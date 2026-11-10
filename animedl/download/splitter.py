@@ -74,6 +74,8 @@ async def split_for_telegram(
     actual_size = result.path.stat().st_size
     if actual_size <= max_bytes:
         return [result]
+    if shutil.disk_usage(result.path.parent).free < actual_size * 2 + 256 * 1024**2:
+        raise OSError("Недостаточно свободного места для безопасного разделения видео")
     info = await ffprobe_media(result.path)
     duration = info.get("duration") or result.duration
     if not duration or not math.isfinite(duration) or duration <= 0:
