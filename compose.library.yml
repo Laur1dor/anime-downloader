@@ -8,6 +8,7 @@ services:
       TELEGRAM_API_LOCAL_MODE: "1"
       TELEGRAM_LOCAL_FILE_ROOT: /app/media/.animedl-work
     volumes:
+      - bot-api-data:/var/lib/telegram-bot-api:ro
       - type: bind
         source: ${LIBRARY_HOST_DIR:?set LIBRARY_HOST_DIR to an existing mounted media folder}
         target: /app/library

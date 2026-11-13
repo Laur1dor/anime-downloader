@@ -10,7 +10,7 @@ from aiogram import Dispatcher
 from animedl.cache.store import CacheStore
 from animedl.catalog import CatalogStore
 from animedl.config import load_config
-from animedl.handlers import admin, common, flow, search, support
+from animedl.handlers import admin, common, flow, inbox, search, support
 from animedl.handlers.access import AccessMiddleware
 from animedl.logging_setup import setup_logging
 from animedl.observability import AuditMiddleware, AuditStore
@@ -94,6 +94,7 @@ async def main() -> None:
     dp.message.middleware(guard)
     dp.callback_query.middleware(guard)
 
+    dp.include_router(inbox.router)
     dp.include_router(support.router)
     dp.include_router(common.router)
     dp.include_router(admin.router)
