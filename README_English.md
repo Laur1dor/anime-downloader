@@ -125,3 +125,5 @@ notification attempts are visible. Feedback is limited to 20 messages per user p
 Duplicate button presses are suppressed, reports coalesce, and notification calls share
 the rate-limited monitoring queue. Legacy history is not fabricated; quotes of older
 bot notifications can be retained when users reply to them.
+
+In a private chat, the owner can send or forward a video and choose Save to NAS. With MEDIA_ROOT mounted and the local Bot API configured via compose.library.yml, the original is saved to TelegramInbox, separate from the Jellyfin libraries.
